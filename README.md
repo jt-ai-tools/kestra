@@ -16,6 +16,10 @@
 <a href="https://kestra.io/slack"><img src="https://img.shields.io/badge/Slack-Join%20Community-blueviolet?logo=slack" alt="Slack"></a>
 </div>
 
+<p align="center">
+  <a href="README_zh_TW.md"><b>繁體中文版</b></a>
+</p>
+
 <br />
 
 <p align="center">
