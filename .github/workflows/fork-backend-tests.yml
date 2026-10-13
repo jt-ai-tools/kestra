@@ -190,7 +190,7 @@ jobs:
             component=backend
       - name: Preserve fork test reports
         if: ${{ always() && github.repository != 'kestra-io/kestra' }}
-        uses: actions/upload-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fork-backend-test-reports
           path: "**/build/test-results/test/TEST-*.xml"
