@@ -1,12 +1,14 @@
 package io.kestra.core.services;
 
+import org.junit.jupiter.api.Test;
+
 import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.flows.Flow;
 import io.kestra.core.models.flows.GenericFlow;
 import io.kestra.core.repositories.FlowRepositoryInterface;
 import io.kestra.core.tenant.TenantService;
+
 import jakarta.inject.Inject;
-import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -26,6 +28,15 @@ class NamespaceServiceTest {
         flowRepository.create(GenericFlow.of(flow));
 
         assertThat(namespaceService.isNamespaceExists(TenantService.MAIN_TENANT, "io.kestra")).isTrue();
+    }
+
+    @Test
+    void shouldNotFindNamespaceWhenOnlySiblingSharingPrefixExists() {
+        Flow flow = Flow.builder().id("test").namespace("prefixtest2.child").tenantId(TenantService.MAIN_TENANT).build();
+        flowRepository.create(GenericFlow.of(flow));
+
+        assertThat(namespaceService.isNamespaceExists(TenantService.MAIN_TENANT, "prefixtest")).isFalse();
+        assertThat(namespaceService.isNamespaceExists(TenantService.MAIN_TENANT, "prefixtest2")).isTrue();
     }
 
     @Test

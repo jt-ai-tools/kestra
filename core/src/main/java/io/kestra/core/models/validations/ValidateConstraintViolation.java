@@ -1,19 +1,19 @@
 package io.kestra.core.models.validations;
 
+import java.util.List;
+import java.util.stream.Collectors;
+
 import com.fasterxml.jackson.annotation.JsonIgnore;
-import io.micronaut.core.annotation.Introspected;
+
 import jakarta.validation.constraints.NotNull;
 import lombok.*;
 import lombok.experimental.SuperBuilder;
 import lombok.extern.slf4j.Slf4j;
 
-import java.util.List;
-
 @SuperBuilder(toBuilder = true)
 @Getter
 @AllArgsConstructor
 @NoArgsConstructor
-@Introspected
 @ToString
 @Slf4j
 @EqualsAndHashCode
@@ -25,11 +25,20 @@ public class ValidateConstraintViolation {
     private String namespace;
     private String flow;
 
-    private String constraints;
     private boolean outdated;
     private List<String> deprecationPaths;
     private List<String> warnings;
     private List<String> infos;
+    private List<ValidationError> errors;
+
+    public List<ValidationError> getErrors() {
+        return errors == null ? List.of() : errors;
+    }
+
+    @Deprecated
+    public String getConstraints() {
+        return getErrors().stream().map(ValidationError::toLine).collect(Collectors.joining("\n"));
+    }
 
     @JsonIgnore
     public String getIdentity() {

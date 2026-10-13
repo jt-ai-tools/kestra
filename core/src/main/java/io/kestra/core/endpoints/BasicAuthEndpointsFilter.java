@@ -1,5 +1,12 @@
 package io.kestra.core.endpoints;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.Optional;
+
+import org.reactivestreams.Publisher;
+
+import io.kestra.core.utils.AuthUtils;
 import io.micronaut.context.annotation.Requires;
 import io.micronaut.core.async.publisher.Publishers;
 import io.micronaut.http.*;
@@ -12,15 +19,12 @@ import io.micronaut.management.endpoint.annotation.Endpoint;
 import io.micronaut.web.router.MethodBasedRouteMatch;
 import io.micronaut.web.router.RouteMatch;
 import io.micronaut.web.router.RouteMatchUtils;
-import org.reactivestreams.Publisher;
-
-import java.nio.charset.StandardCharsets;
-import java.util.Base64;
-import java.util.Optional;
 
 @Filter("/**")
 @Requires(property = "endpoints.all.basic-auth")
 public class BasicAuthEndpointsFilter implements HttpServerFilter {
+    private static final String BASIC_PREFIX = HttpHeaderValues.AUTHORIZATION_PREFIX_BASIC + " ";
+
     private final EndpointBasicAuthConfiguration endpointBasicAuthConfiguration;
 
     public BasicAuthEndpointsFilter(EndpointBasicAuthConfiguration endpointBasicAuthConfiguration) {
@@ -45,19 +49,33 @@ public class BasicAuthEndpointsFilter implements HttpServerFilter {
 
     private boolean validateUser(HttpRequest<?> request) {
         final String authorization = request.getHeaders().get(HttpHeaders.AUTHORIZATION);
-        if (authorization != null && authorization.startsWith(HttpHeaderValues.AUTHORIZATION_PREFIX_BASIC)) {
-            String base64Credentials = authorization.substring(6);
-            byte[] credDecoded = Base64.getDecoder().decode(base64Credentials);
-            String credentials = new String(credDecoded, StandardCharsets.UTF_8);
-
-            final String[] values = credentials.split(":", 2);
-            if (values.length == 2) {
-                return this.endpointBasicAuthConfiguration.getUsername().equals(values[0]) &&
-                    this.endpointBasicAuthConfiguration.getPassword().equals(values[1]);
-            }
+        if (authorization == null || !authorization.startsWith(BASIC_PREFIX)) {
+            return false;
         }
 
-        return false;
+        final Optional<String> credentials = decodeCredentials(authorization.substring(BASIC_PREFIX.length()));
+        if (credentials.isEmpty()) {
+            return false;
+        }
+
+        final String[] values = credentials.get().split(":", 2);
+        if (values.length != 2) {
+            return false;
+        }
+
+        // Compare both operands without short-circuiting so a wrong username cannot be
+        // distinguished from a wrong password by response time (GHSA-38rc-2jxj-2h75).
+        boolean usernameMatches = AuthUtils.constantTimeEquals(this.endpointBasicAuthConfiguration.getUsername(), values[0]);
+        boolean passwordMatches = AuthUtils.constantTimeEquals(this.endpointBasicAuthConfiguration.getPassword(), values[1]);
+        return usernameMatches & passwordMatches;
+    }
+
+    private static Optional<String> decodeCredentials(String base64Credentials) {
+        try {
+            return Optional.of(new String(Base64.getDecoder().decode(base64Credentials), StandardCharsets.UTF_8));
+        } catch (IllegalArgumentException e) {
+            return Optional.empty();
+        }
     }
 
     @Override

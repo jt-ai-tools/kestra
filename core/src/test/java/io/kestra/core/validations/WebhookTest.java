@@ -1,13 +1,16 @@
 package io.kestra.core.validations;
 
-import io.kestra.plugin.core.condition.MultipleCondition;
-import io.kestra.plugin.core.trigger.Webhook;
-import io.kestra.core.models.validations.ModelValidator;
-import io.kestra.core.junit.annotations.KestraTest;
-import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
-import java.util.List;
+import com.fasterxml.jackson.core.JsonProcessingException;
+
+import io.kestra.core.junit.annotations.KestraTest;
+import io.kestra.core.models.validations.ModelValidator;
+import io.kestra.core.serializers.JacksonMapper;
+import io.kestra.plugin.core.trigger.AbstractWebhookTrigger;
+import io.kestra.plugin.core.trigger.Webhook;
+
+import jakarta.inject.Inject;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -15,23 +18,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 public class WebhookTest {
     @Inject
     private ModelValidator modelValidator;
-
-    @Test
-    void webhookValidation()  {
-        var webhook = Webhook.builder()
-            .id("webhook")
-            .type(Webhook.class.getName())
-            .key("webhook")
-            .conditions(
-                List.of(
-                    MultipleCondition.builder().id("multiple").type(MultipleCondition.class.getName()).build()
-                )
-            )
-            .build();
-
-        assertThat(modelValidator.isValid(webhook).isPresent()).isTrue();
-        assertThat(modelValidator.isValid(webhook).get().getMessage()).contains("invalid webhook: conditions of type MultipleCondition are not supported");
-    }
 
     @Test
     void webhookResponseContentTypeValidation() {
@@ -73,5 +59,22 @@ public class WebhookTest {
             .build();
 
         assertThat(modelValidator.isValid(nullContentType).isPresent()).isFalse();
+    }
+
+    @Test
+    void shouldFetchBodyAndStayValidWhenTriggerDeclaresNoFetchType() throws JsonProcessingException {
+        // Given - a webhook trigger as flows declared it before the property existed
+        Webhook webhook = JacksonMapper.ofYaml().readValue(
+            """
+                id: webhook
+                type: io.kestra.plugin.core.trigger.Webhook
+                key: a-secret-key
+                """,
+            Webhook.class
+        );
+
+        // When / Then - the body reaches the flow as it always has, and no existing flow turns invalid
+        assertThat(webhook.getFetchType()).isEqualTo(AbstractWebhookTrigger.FetchType.FETCH);
+        assertThat(modelValidator.isValid(webhook)).isEmpty();
     }
 }

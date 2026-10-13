@@ -1,14 +1,17 @@
 package io.kestra.core.runners.pebble.filters;
 
-import io.kestra.core.exceptions.IllegalVariableEvaluationException;
-import io.kestra.core.runners.VariableRenderer;
-import io.kestra.core.junit.annotations.KestraTest;
+import java.util.Map;
+
 import org.junit.jupiter.api.Test;
 
-import java.util.Map;
+import io.kestra.core.exceptions.IllegalVariableEvaluationException;
+import io.kestra.core.junit.annotations.KestraTest;
+import io.kestra.core.runners.VariableRenderer;
+
 import jakarta.inject.Inject;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @KestraTest
 class IndentFilterTest {
@@ -65,7 +68,7 @@ class IndentFilterTest {
 
     @Test
     void indentStringWithSystemNewLine() throws IllegalVariableEvaluationException {
-        String render = variableRenderer.render("{{ \"first line"+System.lineSeparator()+"second line\" | indent(2) }}", Map.of());
+        String render = variableRenderer.render("{{ \"first line" + System.lineSeparator() + "second line\" | indent(2) }}", Map.of());
         assertThat(render).isEqualTo("first line" + System.lineSeparator() + "  second line");
     }
 
@@ -73,6 +76,13 @@ class IndentFilterTest {
     void indentWithTab() throws IllegalVariableEvaluationException {
         String render = variableRenderer.render("{{ \"first line\nsecond line\" | indent(2, \"\t\") }}", Map.of());
         assertThat(render).isEqualTo("first line\n\t\tsecond line");
+    }
+
+    @Test
+    void indentRejectsExcessiveAmount() {
+        assertThatThrownBy(() -> variableRenderer.render("{{ 'x' | indent(2000000000) }}", Map.of()))
+            .isInstanceOf(IllegalVariableEvaluationException.class)
+            .hasMessageContaining("cannot exceed");
     }
 
 }

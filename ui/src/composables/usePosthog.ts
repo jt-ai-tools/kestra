@@ -23,23 +23,29 @@ interface Config {
     edition?: string
 }
 
-function statsGlobalData(config: Config, uid: string): any {
+function statsGlobalData(config: Config, uid: string) {
     return {
         from: "APP",
         iid: config.uuid,
         uid: uid,
         app: {
             version: config.version,
-            type: config.edition
-        }
+            type: config.edition,
+        },
     }
 }
 
 const SURVEY_HOOKS_FLAG = "__kestra_posthog_survey_hooks_installed"
 
+declare global {
+    interface Window {
+        [SURVEY_HOOKS_FLAG]?: boolean
+    }
+}
+
 function installSurveyHooksOnce() {
-    if ((window as any)[SURVEY_HOOKS_FLAG]) return
-    (window as any)[SURVEY_HOOKS_FLAG] = true
+    if (window[SURVEY_HOOKS_FLAG]) return
+    window[SURVEY_HOOKS_FLAG] = true
 
     let surveyVisible = false
     window.addEventListener("PHSurveyShown", () => {
@@ -66,7 +72,7 @@ export async function initPostHogForSetup(config: Config): Promise<void> {
 
         // PostHog can already be initialized (e.g. user logs out then logs back in without a full page refresh).
         // In that case we don't need to init again.
-        if ((posthog as any)?.__loaded) {
+        if (posthog.__loaded) {
             installSurveyHooksOnce()
             return
         }
@@ -84,7 +90,7 @@ export async function initPostHogForSetup(config: Config): Promise<void> {
             autocapture: false,
         })
 
-        posthog.register_for_session(statsGlobalData(config, uid));
+        posthog.register_for_session(statsGlobalData(config, uid))
 
         if (!posthog.get_property("__alias")) {
             posthog.alias(apiConfig.id)
@@ -98,8 +104,8 @@ export async function initPostHogForSetup(config: Config): Promise<void> {
 
 export function trackSetupEvent(
     eventName: string,
-    additionalData: Record<string, any>,
-    userFormData: UserFormData
+    additionalData: Record<string, unknown>,
+    userFormData: UserFormData,
 ): void {
     const miscStore = useMiscStore()
     const uid = getUid()
@@ -109,7 +115,7 @@ export function trackSetupEvent(
     const userInfo = userFormData.firstName ? {
         user_firstname: userFormData.firstName,
         user_lastname: userFormData.lastName,
-        user_email: userFormData.username
+        user_email: userFormData.username,
     } : {}
 
     const eventData: SetupEventData = {
@@ -117,7 +123,7 @@ export function trackSetupEvent(
         instance_id: miscStore.configs?.uuid,
         user_id: uid,
         ...userInfo,
-        ...additionalData
+        ...additionalData,
     }
 
     useApiStore().posthogEvents(eventData)

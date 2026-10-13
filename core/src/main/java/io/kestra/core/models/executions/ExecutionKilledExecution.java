@@ -1,8 +1,13 @@
 package io.kestra.core.models.executions;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+
+import io.kestra.core.async.AsyncOperation;
+import io.kestra.core.events.Actor;
 import io.kestra.core.models.TenantInterface;
 import io.kestra.core.runners.WorkerTask;
+
+import jakarta.annotation.Nullable;
 import jakarta.validation.constraints.NotNull;
 import lombok.*;
 import lombok.experimental.SuperBuilder;
@@ -12,7 +17,7 @@ import lombok.experimental.SuperBuilder;
 @EqualsAndHashCode
 @ToString
 @NoArgsConstructor
-public class ExecutionKilledExecution extends ExecutionKilled implements TenantInterface {
+public class ExecutionKilledExecution extends ExecutionKilled implements TenantInterface, AsyncOperation {
     @NotNull
     @JsonInclude
     @Builder.Default
@@ -34,6 +39,18 @@ public class ExecutionKilledExecution extends ExecutionKilled implements TenantI
      */
     Boolean isOnKillCascade;
 
+    /**
+     * Optional correlation id for the async operation that triggered this kill.
+     */
+    @Nullable
+    String operationId;
+
+    /**
+     * Who requested the kill, or {@code null} when the system did.
+     */
+    @Nullable
+    Actor actor;
+
     public boolean isEqual(WorkerTask workerTask) {
         String taskTenantId = workerTask.getTaskRun().getTenantId();
         String taskExecutionId = workerTask.getTaskRun().getExecutionId();
@@ -43,5 +60,10 @@ public class ExecutionKilledExecution extends ExecutionKilled implements TenantI
     @Override
     public String uid() {
         return this.executionId;
+    }
+
+    @Override
+    public String operationId() {
+        return this.operationId;
     }
 }

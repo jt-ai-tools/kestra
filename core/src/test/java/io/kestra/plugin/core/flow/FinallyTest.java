@@ -1,18 +1,22 @@
 package io.kestra.plugin.core.flow;
 
+import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.TimeoutException;
+
+import org.junit.jupiter.api.Test;
+
 import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.junit.annotations.LoadFlows;
 import io.kestra.core.models.executions.Execution;
 import io.kestra.core.models.flows.State;
 import io.kestra.core.queues.QueueException;
+import io.kestra.core.repositories.ExecutionRepositoryInterface;
 import io.kestra.core.runners.FlowInputOutput;
 import io.kestra.core.runners.TestRunnerUtils;
-import jakarta.inject.Inject;
-import org.junit.jupiter.api.Test;
+import io.kestra.core.utils.Await;
 
-import java.time.Duration;
-import java.util.Map;
-import java.util.concurrent.TimeoutException;
+import jakarta.inject.Inject;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -26,8 +30,11 @@ class FinallyTest {
     @Inject
     private FlowInputOutput flowIO;
 
+    @Inject
+    private ExecutionRepositoryInterface executionRepository;
+
     @Test
-    @LoadFlows(value = {"flows/valids/finally-sequential.yaml"}, tenantId = "sequentialwithouterrors")
+    @LoadFlows(value = { "flows/valids/finally-sequential.yaml" }, tenantId = "sequentialwithouterrors")
     void sequentialWithoutErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "sequentialwithouterrors",
@@ -44,7 +51,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-sequential.yaml"}, tenantId = "sequentialwitherrors")
+    @LoadFlows(value = { "flows/valids/finally-sequential.yaml" }, tenantId = "sequentialwitherrors")
     void sequentialWithErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "sequentialwitherrors",
@@ -61,7 +68,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-sequential-error.yaml"}, tenantId = "sequentialerrorblockwithouterrors")
+    @LoadFlows(value = { "flows/valids/finally-sequential-error.yaml" }, tenantId = "sequentialerrorblockwithouterrors")
     void sequentialErrorBlockWithoutErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "sequentialerrorblockwithouterrors",
@@ -78,7 +85,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-sequential-error-first.yaml"}, tenantId = "sequentialerrorfirst")
+    @LoadFlows(value = { "flows/valids/finally-sequential-error-first.yaml" }, tenantId = "sequentialerrorfirst")
     void sequentialErrorFirst() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne("sequentialerrorfirst", NAMESPACE, "finally-sequential-error-first");
 
@@ -90,7 +97,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-sequential-error.yaml"}, tenantId = "sequentialerrorblockwitherrors")
+    @LoadFlows(value = { "flows/valids/finally-sequential-error.yaml" }, tenantId = "sequentialerrorblockwitherrors")
     void sequentialErrorBlockWithErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "sequentialerrorblockwitherrors",
@@ -109,7 +116,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-allowfailure.yaml"}, tenantId = "allowfailurewithouterrors")
+    @LoadFlows(value = { "flows/valids/finally-allowfailure.yaml" }, tenantId = "allowfailurewithouterrors")
     void allowFailureWithoutErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "allowfailurewithouterrors",
@@ -126,7 +133,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-allowfailure.yaml"}, tenantId = "allowfailurewitherrors")
+    @LoadFlows(value = { "flows/valids/finally-allowfailure.yaml" }, tenantId = "allowfailurewitherrors")
     void allowFailureWithErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "allowfailurewitherrors",
@@ -145,7 +152,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-parallel.yaml"}, tenantId = "parallelwithouterrors")
+    @LoadFlows(value = { "flows/valids/finally-parallel.yaml" }, tenantId = "parallelwithouterrors")
     void parallelWithoutErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "parallelwithouterrors",
@@ -162,7 +169,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-parallel.yaml"}, tenantId = "parallelwitherrors")
+    @LoadFlows(value = { "flows/valids/finally-parallel.yaml" }, tenantId = "parallelwitherrors")
     void parallelWithErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "parallelwitherrors",
@@ -181,79 +188,108 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-foreach.yaml"}, tenantId = "foreachwithouterrors")
-    void forEachWithoutErrors() throws QueueException, TimeoutException {
+    @LoadFlows(value = { "flows/valids/finally-loop.yaml" }, tenantId = "loopwithouterrors")
+    void loopWithoutErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
-            "foreachwithouterrors",
-            NAMESPACE, "finally-foreach", null,
+            "loopwithouterrors",
+            NAMESPACE, "finally-loop", null,
             (flow, execution1) -> flowIO.readExecutionInputs(flow, execution1, Map.of("failed", false)),
             Duration.ofSeconds(60)
         );
 
-        assertThat(execution.getTaskRunList()).hasSize(9);
+        assertThat(execution.getTaskRunList()).hasSize(1);
         assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
-        assertThat(execution.findTaskRunsByTaskId("ok").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
-        assertThat(execution.findTaskRunsByTaskId("a1").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
-        assertThat(execution.findTaskRunsByTaskId("a2").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+
+        var subExecutions = executionRepository.findLoopSubExecutions(execution.getTenantId(), execution.getId(), null);
+        assertThat(subExecutions.size()).isEqualTo(3);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("ok").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("a1").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("a2").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-foreach.yaml"}, tenantId = "foreachwitherrors")
-    void forEachWithErrors() throws QueueException, TimeoutException {
+    @LoadFlows(value = { "flows/valids/finally-loop.yaml" }, tenantId = "loopwitherrors")
+    void loopWithErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
-            "foreachwitherrors",
-            NAMESPACE, "finally-foreach", null,
+            "loopwitherrors",
+            NAMESPACE, "finally-loop", null,
             (flow, execution1) -> flowIO.readExecutionInputs(flow, execution1, Map.of("failed", true)),
             Duration.ofSeconds(60)
         );
 
-        assertThat(execution.getTaskRunList()).hasSize(11);
+        assertThat(execution.getTaskRunList()).hasSize(1);
         assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.FAILED);
-        assertThat(execution.findTaskRunsByTaskId("ko").getFirst().getState().getCurrent()).isEqualTo(State.Type.FAILED);
-        assertThat(execution.findTaskRunsByTaskId("a1").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
-        assertThat(execution.findTaskRunsByTaskId("a2").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
-        assertThat(execution.findTaskRunsByTaskId("e1").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
-        assertThat(execution.findTaskRunsByTaskId("e2").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+
+        // With transmitFailed=true, the parent terminates when the first sub-execution fails,
+        // but other sub-executions continue running their errors/finally tasks in parallel.
+        // Wait for all sub-executions to reach terminal state before asserting.
+        Await.until(
+            () -> executionRepository.findLoopSubExecutions(execution.getTenantId(), execution.getId(), null).stream().allMatch(e -> e.getState().isTerminated()),
+            Duration.ofMillis(100),
+            Duration.ofSeconds(30)
+        );
+        var subExecutions = executionRepository.findLoopSubExecutions(execution.getTenantId(), execution.getId(), null);
+        assertThat(subExecutions.size()).isEqualTo(3);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("ko").getFirst().getState().getCurrent()).isEqualTo(State.Type.FAILED);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("a1").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("a2").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("e1").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("e2").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-eachparallel.yaml"}, tenantId = "eachparallelwithouterrors")
-    void eachParallelWithoutErrors() throws QueueException, TimeoutException {
+    @LoadFlows(value = { "flows/valids/finally-loop-parallel.yaml" }, tenantId = "loopparallelwithouterrors")
+    void loopParallelWithoutErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
-            "eachparallelwithouterrors",
-            NAMESPACE, "finally-eachparallel", null,
+            "loopparallelwithouterrors",
+            NAMESPACE, "finally-loop-parallel", null,
             (flow, execution1) -> flowIO.readExecutionInputs(flow, execution1, Map.of("failed", false)),
             Duration.ofSeconds(60)
         );
 
-        assertThat(execution.getTaskRunList()).hasSize(9);
+        assertThat(execution.getTaskRunList()).hasSize(1);
         assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
-        assertThat(execution.findTaskRunsByTaskId("ok").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
-        assertThat(execution.findTaskRunsByTaskId("a1").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
-        assertThat(execution.findTaskRunsByTaskId("a2").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+
+        var subExecutions = executionRepository.findLoopSubExecutions(execution.getTenantId(), execution.getId(), null);
+        assertThat(subExecutions.size()).isEqualTo(3);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("ok").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("a1").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("a2").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-eachparallel.yaml"}, tenantId = "eachparallelwitherrors")
-    void eachParallelWithErrors() throws QueueException, TimeoutException {
+    @LoadFlows(value = { "flows/valids/finally-loop-parallel.yaml" }, tenantId = "loopparallelwitherrors")
+    void loopParallelWithErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
-            "eachparallelwitherrors",
-            NAMESPACE, "finally-eachparallel", null,
+            "loopparallelwitherrors",
+            NAMESPACE, "finally-loop-parallel", null,
             (flow, execution1) -> flowIO.readExecutionInputs(flow, execution1, Map.of("failed", true)),
             Duration.ofSeconds(60)
         );
 
-        assertThat(execution.getTaskRunList()).hasSize(11);
+        assertThat(execution.getTaskRunList()).hasSize(1);
         assertThat(execution.getState().getCurrent()).isEqualTo(State.Type.FAILED);
-        assertThat(execution.findTaskRunsByTaskId("ko").getFirst().getState().getCurrent()).isEqualTo(State.Type.FAILED);
-        assertThat(execution.findTaskRunsByTaskId("a1").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
-        assertThat(execution.findTaskRunsByTaskId("a2").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
-        assertThat(execution.findTaskRunsByTaskId("e1").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
-        assertThat(execution.findTaskRunsByTaskId("e2").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+
+        // With transmitFailed=true, the parent terminates when the first sub-execution fails,
+        // but other sub-executions continue running their errors/finally tasks in parallel.
+        // Wait for all sub-executions to reach terminal state before asserting.
+        Await.until(
+            () -> executionRepository.findLoopSubExecutions(execution.getTenantId(), execution.getId(), null).stream().allMatch(e -> e.getState().isTerminated()),
+            Duration.ofMillis(100),
+            Duration.ofSeconds(30)
+        );
+        var subExecutions = executionRepository.findLoopSubExecutions(execution.getTenantId(), execution.getId(), null);
+        assertThat(subExecutions.size()).isEqualTo(3);
+
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("ko").getFirst().getState().getCurrent()).isEqualTo(State.Type.FAILED);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("a1").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("a2").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("e1").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
+        assertThat(subExecutions.getFirst().findTaskRunsByTaskId("e2").getFirst().getState().getCurrent()).isEqualTo(State.Type.SUCCESS);
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-dag.yaml"}, tenantId = "dagwithouterrors")
+    @LoadFlows(value = { "flows/valids/finally-dag.yaml" }, tenantId = "dagwithouterrors")
     void dagWithoutErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "dagwithouterrors",
@@ -270,7 +306,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-dag.yaml"}, tenantId = "dagwitherrors")
+    @LoadFlows(value = { "flows/valids/finally-dag.yaml" }, tenantId = "dagwitherrors")
     void dagWithErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "dagwitherrors",
@@ -289,7 +325,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-flow.yaml"}, tenantId = "flowwithouterrors")
+    @LoadFlows(value = { "flows/valids/finally-flow.yaml" }, tenantId = "flowwithouterrors")
     void flowWithoutErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "flowwithouterrors",
@@ -306,7 +342,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-flow.yaml"}, tenantId = "flowwitherrors")
+    @LoadFlows(value = { "flows/valids/finally-flow.yaml" }, tenantId = "flowwitherrors")
     void flowWithErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "flowwitherrors",
@@ -323,7 +359,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-flow-error.yaml"}, tenantId = "flowerrorblockwithouterrors")
+    @LoadFlows(value = { "flows/valids/finally-flow-error.yaml" }, tenantId = "flowerrorblockwithouterrors")
     void flowErrorBlockWithoutErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "flowerrorblockwithouterrors",
@@ -340,7 +376,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-flow-error.yaml"}, tenantId = "flowerrorblockwitherrors")
+    @LoadFlows(value = { "flows/valids/finally-flow-error.yaml" }, tenantId = "flowerrorblockwitherrors")
     void flowErrorBlockWithErrors() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne(
             "flowerrorblockwitherrors",
@@ -359,7 +395,7 @@ class FinallyTest {
     }
 
     @Test
-    @LoadFlows(value = {"flows/valids/finally-flow-error-first.yaml"}, tenantId = "flowerrorfirst")
+    @LoadFlows(value = { "flows/valids/finally-flow-error-first.yaml" }, tenantId = "flowerrorfirst")
     void flowErrorFirst() throws QueueException, TimeoutException {
         Execution execution = runnerUtils.runOne("flowerrorfirst", NAMESPACE, "finally-flow-error-first");
 

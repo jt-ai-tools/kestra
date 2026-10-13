@@ -1,5 +1,8 @@
 package io.kestra.plugin.core.execution;
 
+import java.util.List;
+import java.util.Map;
+
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.executions.Execution;
@@ -7,13 +10,11 @@ import io.kestra.core.models.property.Property;
 import io.kestra.core.models.tasks.ExecutionUpdatableTask;
 import io.kestra.core.models.tasks.Task;
 import io.kestra.core.runners.RunContext;
+
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
 import lombok.*;
 import lombok.experimental.SuperBuilder;
-
-import java.util.List;
-import java.util.Map;
 
 @SuperBuilder
 @ToString
@@ -66,11 +67,12 @@ public class UnsetVariables extends Task implements ExecutionUpdatableTask {
     @Builder.Default
     private Property<Boolean> ignoreMissing = Property.ofValue(false);
 
-
     @Override
     public Execution update(Execution execution, RunContext runContext) throws Exception {
-        List<String> renderedVariables = runContext.render(variables).asList(String.class);
-        boolean renderedIgnoreMissing = runContext.render(ignoreMissing).as(Boolean.class).orElseThrow();
+        // the executor reuses the task instance of its cached flow for every execution of the flow,
+        // so the rendering cache of the properties must be skipped to render with the current execution context
+        List<String> renderedVariables = runContext.render(this.variables.skipCache()).asList(String.class);
+        boolean renderedIgnoreMissing = runContext.render(this.ignoreMissing.skipCache()).as(Boolean.class).orElseThrow();
         Map<String, Object> variables = execution.getVariables();
         for (String key : renderedVariables) {
             removeVar(variables, key, renderedIgnoreMissing);
@@ -78,14 +80,23 @@ public class UnsetVariables extends Task implements ExecutionUpdatableTask {
         return execution.withVariables(variables);
     }
 
+    @SuppressWarnings("unchecked")
     private void removeVar(Map<String, Object> vars, String key, boolean ignoreMissing) {
         if (key.indexOf('.') >= 0) {
             String prefix = key.substring(0, key.indexOf('.'));
             String suffix = key.substring(key.indexOf('.') + 1);
+
+            Object child = vars.get(prefix);
+            if (!(child instanceof Map)) {
+                if (!ignoreMissing) {
+                    throw new IllegalArgumentException("Variable '" + key + "' not found and `ignoreMissing` is false");
+                }
+                return;
+            }
             removeVar((Map<String, Object>) vars.get(prefix), suffix, ignoreMissing);
         } else {
-            if (ignoreMissing && !vars.containsKey(key)) {
-                return;
+            if (!ignoreMissing && !vars.containsKey(key)) {
+                throw new IllegalArgumentException("Variable '" + key + "' not found and `ignoreMissing` is false");
             }
             vars.remove(key);
         }

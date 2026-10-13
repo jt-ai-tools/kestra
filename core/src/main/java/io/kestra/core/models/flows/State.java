@@ -1,16 +1,5 @@
 package io.kestra.core.models.flows;
 
-import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.fasterxml.jackson.annotation.JsonInclude;
-import com.fasterxml.jackson.annotation.JsonProperty;
-import io.kestra.core.models.tasks.Task;
-import io.micronaut.core.annotation.Introspected;
-import jakarta.validation.Valid;
-import jakarta.validation.constraints.NotNull;
-import lombok.Value;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.time.DurationFormatUtils;
-
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -19,14 +8,27 @@ import java.util.List;
 import java.util.Optional;
 import java.util.stream.Stream;
 
+import org.apache.commons.lang3.time.DurationFormatUtils;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+import io.kestra.core.models.tasks.Task;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import lombok.Value;
+import lombok.extern.slf4j.Slf4j;
+
 @Value
 @Slf4j
-@Introspected
 public class State {
     @NotNull
     @JsonInclude
     Type current;
 
+    @NotNull
     @Valid
     List<History> histories;
 
@@ -105,8 +107,33 @@ public class State {
         return this.getDuration().orElseGet(() -> Duration.between(this.getStartDate(), Instant.now()));
     }
 
+    /**
+     * Duration from the most recent {@link Type#RUNNING} transition to the terminal date — how long the last
+     * attempt actually ran. Empty if it never entered RUNNING or hasn't ended. Unlike {@link #getDuration()}
+     * (start → end), this excludes pre-RUNNING time and earlier retry attempts.
+     */
+    @JsonIgnore
+    public Optional<Duration> lastRunningDuration() {
+        Optional<Instant> end = this.getEndDate();
+        if (end.isEmpty()) {
+            return Optional.empty();
+        }
+        Instant runningAt = null;
+        for (History history : this.histories) {
+            if (history.getState() == Type.RUNNING) {
+                runningAt = history.getDate();
+            }
+        }
+        return runningAt == null ? Optional.empty() : Optional.of(Duration.between(runningAt, end.get()));
+    }
+
     @JsonProperty(access = JsonProperty.Access.READ_ONLY)
     public Instant getStartDate() {
+        // this specifically might happen for dynamic task runs
+        if (this.histories.isEmpty()) {
+            return null;
+        }
+
         return this.histories.getFirst().getDate();
     }
 
@@ -117,7 +144,11 @@ public class State {
             return Optional.empty();
         }
 
-        return Optional.of(this.histories.get(this.histories.size() - 1).getDate());
+        if (this.histories.isEmpty()) {
+            return Optional.empty();
+        }
+
+        return Optional.of(this.histories.getLast().getDate());
     }
 
     public String humanDuration() {
@@ -133,7 +164,7 @@ public class State {
             return Instant.now();
         }
 
-        return this.histories.get(this.histories.size() - 1).getDate();
+        return this.histories.getLast().getDate();
     }
 
     public Instant minDate() {
@@ -149,9 +180,13 @@ public class State {
         return this.current.isTerminated();
     }
 
+    /**
+     * A PAUSED execution cannot be restarted: it must be resumed or killed instead.
+     * Restarting it would resume the Pause task without any resume information, leading to a failed execution.
+     */
     @JsonIgnore
     public boolean canBeRestarted() {
-        return (this.current.isTerminated() || this.current.isPaused()) && !this.current.isKilled();
+        return this.current.isFailed();
     }
 
     @JsonIgnore
@@ -175,6 +210,7 @@ public class State {
     }
 
     @JsonIgnore
+    // Used in EE
     public static Type[] runningTypes() {
         return Arrays.stream(Type.values())
             .filter(type -> type.isRunning() || type.isCreated())
@@ -211,21 +247,12 @@ public class State {
         return this.current.isSuccess();
     }
 
-    @JsonIgnore
-    public boolean isRestartable() {
-        return this.current.isFailed() || this.isPaused();
-    }
-
-    @JsonIgnore
-    public boolean isResumable() {
-        return this.current.isPaused() || this.current.isRetrying() || this.current.isCreated();
-    }
-
     /**
      * Checks whether the state is restarted after being paused.
      *
      * @return {@code true} if resuming. Otherwise {@code false}.
      */
+    // Used in EE
     @JsonIgnore
     public boolean isResumingAfterPause() {
         if (!this.current.equals(Type.RESTARTED) || this.histories.size() < 2) {
@@ -235,14 +262,26 @@ public class State {
     }
 
     /**
+     * Checks whether the state is resuming after being suspended at a breakpoint.
+     *
+     * @return {@code true} if resuming from a breakpoint. Otherwise {@code false}.
+     */
+    @JsonIgnore
+    public boolean isResumingFromBreakpoint() {
+        if (!this.current.isCreated() || this.histories.size() < 2) {
+            return false;
+        }
+        return this.histories.get(this.histories.size() - 2).state.isBreakpoint();
+    }
+
+    /**
      * Return true if the execution has failed, then was restarted.
      * This is to disambiguate between a RESTARTED after PAUSED and RESTARTED after FAILED state.
      */
     public boolean failedThenRestarted() {
-       return this.current ==  Type.RESTARTED && this.histories.get(this.histories.size() - 2).state.isFailed();
+        return this.current == Type.RESTARTED && this.histories.get(this.histories.size() - 2).state.isFailed();
     }
 
-    @Introspected
     public enum Type {
         CREATED,
         SUBMITTED,
@@ -263,11 +302,16 @@ public class State {
         RESUBMITTED;
 
         public boolean isTerminated() {
-            return this == Type.FAILED || this == Type.WARNING || this == Type.SUCCESS || this == Type.KILLED || this == Type.CANCELLED || this == Type.RETRIED || this == Type.SKIPPED || this == Type.RESUBMITTED;
+            return this == Type.FAILED || this == Type.WARNING || this == Type.SUCCESS || this == Type.KILLED || this == Type.CANCELLED || this == Type.RETRIED || this == Type.SKIPPED
+                || this == Type.RESUBMITTED;
         }
 
         public boolean isTerminatedNoFail() {
             return this == Type.WARNING || this == Type.SUCCESS || this == Type.RETRIED || this == Type.SKIPPED || this == Type.RESUBMITTED;
+        }
+
+        public boolean isTerminatedInError() {
+            return this == Type.FAILED || this == Type.KILLED || this == Type.CANCELLED;
         }
 
         public boolean isCreated() {
@@ -302,12 +346,16 @@ public class State {
             return this == Type.SUCCESS;
         }
 
-        public boolean isKilled(){
+        public boolean isKilled() {
             return this == Type.KILLED;
         }
 
-        public boolean isQueued(){
+        public boolean isQueued() {
             return this == Type.QUEUED;
+        }
+
+        public boolean isCancelled() {
+            return this == Type.CANCELLED;
         }
 
         /**

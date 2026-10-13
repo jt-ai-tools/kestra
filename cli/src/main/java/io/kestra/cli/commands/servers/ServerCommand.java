@@ -1,9 +1,11 @@
 package io.kestra.cli.commands.servers;
 
+import io.kestra.cli.AbstractCommand;
+import io.kestra.cli.Kestra;
+import io.kestra.cli.commands.NoDatabaseCommandInterface;
+
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
-import io.kestra.cli.AbstractCommand;
-import io.kestra.cli.App;
 import picocli.CommandLine;
 
 @CommandLine.Command(
@@ -17,16 +19,17 @@ import picocli.CommandLine;
         StandAloneCommand.class,
         WebServerCommand.class,
         WorkerCommand.class,
-        LocalCommand.class,
+        ControllerCommand.class,
+        LocalCommand.class
     }
 )
 @Slf4j
-public class ServerCommand extends AbstractCommand {
+public class ServerCommand extends AbstractCommand implements NoDatabaseCommandInterface {
     @SneakyThrows
     @Override
     public Integer call() throws Exception {
         super.call();
 
-        return App.runCli(new String[]{"server",  "--help"});
+        return Kestra.runCli(new String[] { "server", "--help" });
     }
 }

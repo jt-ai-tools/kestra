@@ -2,6 +2,7 @@ package io.kestra.plugin.core.dashboard.chart.mardown.sources;
 
 import com.fasterxml.jackson.annotation.JsonSubTypes;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
+
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
@@ -13,12 +14,15 @@ import static io.kestra.core.utils.RegexPatterns.JAVA_IDENTIFIER_REGEX;
 @JsonTypeInfo(
     use = JsonTypeInfo.Id.NAME,
     property = "type",
-    visible = true
+    visible = true,
+    include = JsonTypeInfo.As.EXISTING_PROPERTY
 )
-@JsonSubTypes({
-    @JsonSubTypes.Type(value = FlowDescription.class, name = "FlowDescription"),
-    @JsonSubTypes.Type(value = Text.class, name = "Text")
-})
+@JsonSubTypes(
+    {
+        @JsonSubTypes.Type(value = FlowDescription.class, name = "FlowDescription"),
+        @JsonSubTypes.Type(value = Text.class, name = "Text")
+    }
+)
 public class MarkdownSource {
     @NotNull
     @NotBlank

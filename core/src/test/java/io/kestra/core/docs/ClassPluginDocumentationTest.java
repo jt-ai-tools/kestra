@@ -1,5 +1,14 @@
 package io.kestra.core.docs;
 
+import java.net.URISyntaxException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+import org.junit.jupiter.api.Test;
+
 import io.kestra.core.Helpers;
 import io.kestra.core.models.property.DynamicPropertyExampleTask;
 import io.kestra.core.models.tasks.Task;
@@ -10,14 +19,6 @@ import io.kestra.core.plugins.PluginScanner;
 import io.kestra.core.plugins.RegisteredPlugin;
 import io.kestra.plugin.core.runner.Process;
 import io.kestra.plugin.core.trigger.Schedule;
-import org.junit.jupiter.api.Test;
-
-import java.net.URISyntaxException;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
 
 import static io.kestra.core.utils.Rethrow.throwConsumer;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -26,7 +27,8 @@ class ClassPluginDocumentationTest {
     @SuppressWarnings("unchecked")
     @Test
     void tasks() throws URISyntaxException {
-        Helpers.runApplicationContext(throwConsumer((applicationContext) -> {
+        Helpers.runApplicationContext(throwConsumer((applicationContext) ->
+        {
             JsonSchemaGenerator jsonSchemaGenerator = applicationContext.getBean(JsonSchemaGenerator.class);
 
             Path plugins = Paths.get(Objects.requireNonNull(ClassPluginDocumentationTest.class.getClassLoader().getResource("plugins")).toURI());
@@ -43,12 +45,13 @@ class ClassPluginDocumentationTest {
             assertThat(templatePlugin.getTasks().size()).isEqualTo(1);
 
             PluginClassAndMetadata<Task> metadata = PluginClassAndMetadata.create(
-                templatePlugin, templatePlugin.getTasks().getFirst(), Task.class, null);
+                templatePlugin, templatePlugin.getTasks().getFirst(), Task.class, null
+            );
             ClassPluginDocumentation<? extends Task> doc = ClassPluginDocumentation.of(jsonSchemaGenerator, metadata, templatePlugin.version(), false);
 
             assertThat(doc.getDocExamples().size()).isEqualTo(2);
             assertThat(doc.getIcon()).isNotNull();
-            assertThat(doc.getInputs().size()).isEqualTo(5);
+            assertThat(doc.getInputs().size()).isEqualTo(6);
             assertThat(doc.getDocLicense()).isEqualTo("EE");
 
             // simple
@@ -58,10 +61,11 @@ class ClassPluginDocumentationTest {
             assertThat(((Map<String, String>) doc.getInputs().get("format")).get("description")).contains("of this input");
 
             // definitions
-            assertThat(doc.getDefs().size()).isEqualTo(5);
+            assertThat(doc.getDefs().size()).isEqualTo(9);
 
             // enum
-            Map<String, Object> enumProperties = (Map<String, Object>) ((Map<String, Object>) ((Map<String, Object>) doc.getDefs().get("io.kestra.plugin.templates.ExampleTask-PropertyChildInput")).get("properties")).get("childEnum");
+            Map<String, Object> enumProperties = (Map<String, Object>) ((Map<String, Object>) ((Map<String, Object>) doc.getDefs()
+                .get("io.kestra.plugin.templates.ExampleTask-PropertyChildInput")).get("properties")).get("childEnum");
             assertThat(((List<String>) enumProperties.get("enum")).size()).isEqualTo(2);
             assertThat(((List<String>) enumProperties.get("enum"))).containsExactlyInAnyOrder("VALUE_1", "VALUE_2");
 
@@ -100,7 +104,8 @@ class ClassPluginDocumentationTest {
     @SuppressWarnings("unchecked")
     @Test
     void trigger() throws URISyntaxException {
-        Helpers.runApplicationContext(throwConsumer((applicationContext) -> {
+        Helpers.runApplicationContext(throwConsumer((applicationContext) ->
+        {
             JsonSchemaGenerator jsonSchemaGenerator = applicationContext.getBean(JsonSchemaGenerator.class);
 
             PluginScanner pluginScanner = new PluginScanner(ClassPluginDocumentationTest.class.getClassLoader());
@@ -109,17 +114,19 @@ class ClassPluginDocumentationTest {
             PluginClassAndMetadata<AbstractTrigger> metadata = PluginClassAndMetadata.create(scan, Schedule.class, AbstractTrigger.class, null);
             ClassPluginDocumentation<? extends AbstractTrigger> doc = ClassPluginDocumentation.of(jsonSchemaGenerator, metadata, scan.version(), true);
 
-            assertThat(doc.getDefs()).hasSize(23);
+            // the assets declaration of the trigger base counts the custom asset, the free-form branch of assets.outputs
+            assertThat(doc.getDefs().size()).isEqualTo(5);
             assertThat(doc.getDocLicense()).isNull();
 
-            assertThat(((Map<String, Object>) doc.getDefs().get("io.kestra.core.models.tasks.WorkerGroup")).get("type")).isEqualTo("object");
-            assertThat(((Map<String, Object>) ((Map<String, Object>) doc.getDefs().get("io.kestra.core.models.tasks.WorkerGroup")).get("properties")).size()).isEqualTo(2);
+            assertThat(((Map<String, Object>) doc.getDefs().get("io.kestra.core.models.tasks.WorkerSelector")).get("type")).isEqualTo("object");
+            assertThat(((Map<String, Object>) ((Map<String, Object>) doc.getDefs().get("io.kestra.core.models.tasks.WorkerSelector")).get("properties")).size()).isEqualTo(3);
         }));
     }
 
     @Test
     void taskRunner() throws URISyntaxException {
-        Helpers.runApplicationContext(throwConsumer((applicationContext) -> {
+        Helpers.runApplicationContext(throwConsumer((applicationContext) ->
+        {
             JsonSchemaGenerator jsonSchemaGenerator = applicationContext.getBean(JsonSchemaGenerator.class);
 
             PluginScanner pluginScanner = new PluginScanner(ClassPluginDocumentationTest.class.getClassLoader());
@@ -138,7 +145,8 @@ class ClassPluginDocumentationTest {
     @Test
     @SuppressWarnings("unchecked")
     void dynamicProperty() throws URISyntaxException {
-        Helpers.runApplicationContext(throwConsumer((applicationContext) -> {
+        Helpers.runApplicationContext(throwConsumer((applicationContext) ->
+        {
             JsonSchemaGenerator jsonSchemaGenerator = applicationContext.getBean(JsonSchemaGenerator.class);
 
             PluginScanner pluginScanner = new PluginScanner(ClassPluginDocumentationTest.class.getClassLoader());
@@ -148,9 +156,9 @@ class ClassPluginDocumentationTest {
             ClassPluginDocumentation<? extends DynamicPropertyExampleTask> doc = ClassPluginDocumentation.of(jsonSchemaGenerator, metadata, scan.version(), true);
 
             assertThat(doc.getCls()).isEqualTo("io.kestra.core.models.property.DynamicPropertyExampleTask");
-            assertThat(doc.getDefs()).hasSize(9);
+            assertThat(doc.getDefs()).hasSize(10);
             Map<String, Object> properties = (Map<String, Object>) doc.getPropertiesSchema().get("properties");
-            assertThat(properties).hasSize(22);
+            assertThat(properties).hasSize(23);
 
             Map<String, Object> number = (Map<String, Object>) properties.get("number");
             assertThat(number.get("anyOf")).isNotNull();
@@ -159,12 +167,40 @@ class ClassPluginDocumentationTest {
             assertThat(anyOf.getFirst().get("type")).isEqualTo("integer");
             assertThat((Boolean) anyOf.getFirst().get("$dynamic")).isTrue();
             assertThat(anyOf.get(1).get("type")).isEqualTo("string");
-//            assertThat(anyOf.get(1).get("pattern"), is(".*{{.*}}.*"));
+            //            assertThat(anyOf.get(1).get("pattern"), is(".*{{.*}}.*"));
 
             Map<String, Object> withDefault = (Map<String, Object>) properties.get("withDefault");
             assertThat(withDefault.get("type")).isEqualTo("string");
             assertThat(withDefault.get("default")).isEqualTo("Default Value");
             assertThat((Boolean) withDefault.get("$dynamic")).isTrue();
+        }));
+    }
+
+    // The cache key is (class + version + allProperties): same key must return the cached
+    // instance, while a different version must generate a distinct documentation object.
+    // Bounding/eviction itself is Caffeine's contract (see #16983) and is not re-tested here.
+    @Test
+    void shouldCachePerClassVersionAndAllProperties() throws URISyntaxException {
+        Helpers.runApplicationContext(throwConsumer((applicationContext) ->
+        {
+            // Given
+            JsonSchemaGenerator jsonSchemaGenerator = applicationContext.getBean(JsonSchemaGenerator.class);
+
+            PluginScanner pluginScanner = new PluginScanner(ClassPluginDocumentationTest.class.getClassLoader());
+            RegisteredPlugin scan = pluginScanner.scan();
+
+            PluginClassAndMetadata<DynamicPropertyExampleTask> metadata = PluginClassAndMetadata.create(scan, DynamicPropertyExampleTask.class, DynamicPropertyExampleTask.class, null);
+
+            // When
+            ClassPluginDocumentation<? extends DynamicPropertyExampleTask> first = ClassPluginDocumentation.of(jsonSchemaGenerator, metadata, "1.0.0", true);
+            ClassPluginDocumentation<? extends DynamicPropertyExampleTask> sameKey = ClassPluginDocumentation.of(jsonSchemaGenerator, metadata, "1.0.0", true);
+            ClassPluginDocumentation<? extends DynamicPropertyExampleTask> otherVersion = ClassPluginDocumentation.of(jsonSchemaGenerator, metadata, "2.0.0", true);
+            ClassPluginDocumentation<? extends DynamicPropertyExampleTask> otherProperties = ClassPluginDocumentation.of(jsonSchemaGenerator, metadata, "1.0.0", false);
+
+            // Then
+            assertThat(sameKey).isSameAs(first);
+            assertThat(otherVersion).isNotSameAs(first);
+            assertThat(otherProperties).isNotSameAs(first);
         }));
     }
 }

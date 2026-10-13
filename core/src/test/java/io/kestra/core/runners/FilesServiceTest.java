@@ -1,18 +1,5 @@
 package io.kestra.core.runners;
 
-import io.kestra.core.context.TestRunContextFactory;
-import io.kestra.core.junit.annotations.KestraTest;
-import io.kestra.core.storages.Namespace;
-import io.kestra.core.storages.NamespaceFactory;
-import io.kestra.core.storages.StorageContext;
-import io.kestra.core.storages.StorageInterface;
-import io.micronaut.context.ApplicationContext;
-import io.micronaut.context.annotation.Property;
-import jakarta.inject.Inject;
-import org.apache.commons.io.FileUtils;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
-
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
@@ -22,11 +9,25 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+
+import org.apache.commons.io.FileUtils;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.ExecutionMode;
 
+import io.kestra.core.context.TestRunContextFactory;
+import io.kestra.core.junit.annotations.KestraTest;
+import io.kestra.core.storages.Namespace;
+import io.kestra.core.storages.NamespaceFactory;
+
+import io.micronaut.context.ApplicationContext;
+import io.micronaut.context.annotation.Property;
+import jakarta.inject.Inject;
+
 import static io.kestra.core.tenant.TenantService.MAIN_TENANT;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @KestraTest(rebuildContext = true)
 @Execution(ExecutionMode.SAME_THREAD)
@@ -37,11 +38,25 @@ class FilesServiceTest {
     @Inject
     private ApplicationContext applicationContext;
 
-    @Inject
-    private StorageInterface storageInterface;
 
     @Inject
     private NamespaceFactory namespaceFactory;
+
+    @Test
+    void shouldRejectPathTraversalInInputFileNames() {
+        RunContext runContext = runContextFactory.of();
+        assertThatThrownBy(
+            () -> FilesService.inputFiles(runContext, Map.of("../escape.txt", "content"))
+        ).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void shouldRejectAbsolutePathInInputFileNames() {
+        RunContext runContext = runContextFactory.of();
+        assertThatThrownBy(
+            () -> FilesService.inputFiles(runContext, Map.of("/etc/passwd", "content"))
+        ).isInstanceOf(IllegalArgumentException.class);
+    }
 
     @Test
     void overrideExistingInputFile() throws Exception {
@@ -137,7 +152,7 @@ class FilesServiceTest {
     }
 
     private URI createFile() throws IOException {
-        File tempFile = File.createTempFile("file", ".txt");
+        File tempFile = Files.createTempFile(Path.of("/tmp"), "file", ".txt").toFile();
         Files.write(tempFile.toPath(), "Hello World".getBytes());
         return tempFile.toPath().toUri();
     }
@@ -145,7 +160,7 @@ class FilesServiceTest {
     private URI createNsFile(boolean nsInAuthority) throws IOException, URISyntaxException {
         String namespace = "namespace";
         String filePath = "file.txt";
-        Namespace namespaceStorage = namespaceFactory.of(MAIN_TENANT, namespace, storageInterface);
+        Namespace namespaceStorage = namespaceFactory.of(MAIN_TENANT, namespace);
         namespaceStorage.putFile(Path.of("/" + filePath), new ByteArrayInputStream("Hello World".getBytes()));
         return URI.create("nsfile://" + (nsInAuthority ? namespace : "") + "/" + filePath);
     }

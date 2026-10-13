@@ -1,22 +1,26 @@
 package io.kestra.core.models.namespaces.files;
 
+import java.time.Instant;
+import java.util.Collection;
+
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import io.kestra.core.models.HasUID;
 import io.kestra.core.models.SoftDeletable;
 import io.kestra.core.models.TenantInterface;
 import io.kestra.core.storages.FileAttributes;
 import io.kestra.core.storages.NamespaceFile;
 import io.kestra.core.utils.IdUtils;
+import io.kestra.core.validations.TenantId;
+
 import io.swagger.v3.oas.annotations.Hidden;
 import jakarta.annotation.Nullable;
 import jakarta.validation.constraints.NotNull;
-import jakarta.validation.constraints.Pattern;
 import lombok.*;
 import lombok.experimental.FieldDefaults;
 import lombok.extern.slf4j.Slf4j;
-
-import java.time.Instant;
 
 @Builder(toBuilder = true)
 @Slf4j
@@ -27,7 +31,7 @@ import java.time.Instant;
 public class NamespaceFileMetadata implements SoftDeletable<NamespaceFileMetadata>, TenantInterface, HasUID {
     @With
     @Hidden
-    @Pattern(regexp = "^[a-z0-9][a-z0-9_-]*")
+    @TenantId
     private String tenantId;
 
     @NotNull
@@ -38,8 +42,11 @@ public class NamespaceFileMetadata implements SoftDeletable<NamespaceFileMetadat
 
     private String parentPath;
 
+    // Field renamed to 'revision' but the persisted JSON key stays "version" (frozen via @JsonProperty)
+    // to avoid a JSONB backfill on existing installs; see VersionJsonKeyFreezeTest.
     @NotNull
-    private Integer version;
+    @JsonProperty("version")
+    private Integer revision;
 
     @Builder.Default
     private boolean last = true;
@@ -56,12 +63,14 @@ public class NamespaceFileMetadata implements SoftDeletable<NamespaceFileMetadat
     private boolean deleted;
 
     @JsonCreator
-    public NamespaceFileMetadata(String tenantId, String namespace, String path, String parentPath, Integer version, boolean last, Long size, Instant created, @Nullable Instant updated, boolean deleted) {
+    public NamespaceFileMetadata(String tenantId, String namespace, String path, String parentPath, @JsonProperty("version") Integer revision, boolean last, Long size, Instant created,
+        @Nullable Instant updated,
+        boolean deleted) {
         this.tenantId = tenantId;
         this.namespace = namespace;
         this.path = path;
         this.parentPath = parentPath(path);
-        this.version = version;
+        this.revision = revision;
         this.last = last;
         this.size = size;
         this.created = created;
@@ -85,9 +94,7 @@ public class NamespaceFileMetadata implements SoftDeletable<NamespaceFileMetadat
     public static String parentPath(String path) {
         String withoutTrailingSlash = path.endsWith("/") ? path.substring(0, path.length() - 1) : path;
         // The parent path can't be set, it's always computed
-        return withoutTrailingSlash.contains("/") ?
-            withoutTrailingSlash.substring(0, withoutTrailingSlash.lastIndexOf("/") + 1) :
-            null;
+        return withoutTrailingSlash.contains("/") ? withoutTrailingSlash.substring(0, withoutTrailingSlash.lastIndexOf("/") + 1) : null;
     }
 
     public static NamespaceFileMetadata of(String tenantId, NamespaceFile namespaceFile) {
@@ -95,7 +102,7 @@ public class NamespaceFileMetadata implements SoftDeletable<NamespaceFileMetadat
             .tenantId(tenantId)
             .namespace(namespaceFile.namespace())
             .path(namespaceFile.filePath().toString())
-            .version(namespaceFile.version())
+            .revision(namespaceFile.revision())
             .build();
     }
 
@@ -107,8 +114,28 @@ public class NamespaceFileMetadata implements SoftDeletable<NamespaceFileMetadat
             .created(Instant.ofEpochMilli(fileAttributes.getCreationTime()))
             .updated(Instant.ofEpochMilli(fileAttributes.getLastModifiedTime()))
             .size(fileAttributes.getSize())
-            .version(1)
+            .revision(1)
             .build();
+    }
+
+    /**
+     * Returns the highest revision of the given entries that has been deleted, or {@code 0} when none has.
+     * <p>
+     * Deleting a file flags the entry of its current revision in place, leaving the entries of earlier
+     * revisions untouched, and re-creating the path adds a live entry above them. The deleted entry is
+     * therefore a floor rather than a state of the whole file: everything up to and including it was part
+     * of what the user deleted, whatever happened at the path afterwards, so no revision at or below it may
+     * be served again.
+     *
+     * @param revisions Every entry held for one path, in any order.
+     * @return The highest deleted revision, or {@code 0} if the path has never been deleted.
+     */
+    public static int deletedFloor(Collection<NamespaceFileMetadata> revisions) {
+        return revisions.stream()
+            .filter(NamespaceFileMetadata::isDeleted)
+            .mapToInt(NamespaceFileMetadata::getRevision)
+            .max()
+            .orElse(0);
     }
 
     public NamespaceFileMetadata asLast() {
@@ -123,7 +150,7 @@ public class NamespaceFileMetadata implements SoftDeletable<NamespaceFileMetadat
 
     @Override
     public String uid() {
-        return IdUtils.fromParts(getTenantId(), getNamespace(), getPath(), String.valueOf(getVersion()));
+        return IdUtils.fromParts(getTenantId(), getNamespace(), getPath(), String.valueOf(getRevision()));
     }
 
     @JsonIgnore

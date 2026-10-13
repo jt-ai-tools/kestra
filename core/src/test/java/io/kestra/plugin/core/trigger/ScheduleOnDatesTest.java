@@ -1,5 +1,16 @@
 package io.kestra.plugin.core.trigger;
 
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import org.junit.jupiter.api.Test;
+
 import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.Label;
 import io.kestra.core.models.conditions.ConditionContext;
@@ -8,19 +19,15 @@ import io.kestra.core.models.flows.Type;
 import io.kestra.core.models.flows.input.StringInput;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.triggers.AbstractTrigger;
-import io.kestra.core.models.triggers.Trigger;
 import io.kestra.core.models.triggers.TriggerContext;
+import io.kestra.core.models.triggers.TriggerEvaluationResult;
 import io.kestra.core.runners.DefaultRunContext;
 import io.kestra.core.runners.RunContextFactory;
 import io.kestra.core.runners.RunContextInitializer;
+import io.kestra.core.scheduler.SchedulerClock;
 import io.kestra.core.utils.IdUtils;
-import jakarta.inject.Inject;
-import org.junit.jupiter.api.Test;
 
-import java.time.ZonedDateTime;
-import java.time.temporal.ChronoUnit;
-import java.util.List;
-import java.util.Optional;
+import jakarta.inject.Inject;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -42,15 +49,14 @@ class ScheduleOnDatesTest {
         var scheduleOnDates = ScheduleOnDates.builder()
             .id(IdUtils.create())
             .type(ScheduleOnDates.class.getName())
-            .interval(null)
             .dates(Property.ofValue(List.of(before, after, later)))
             .build();
-        var triggerContext = TriggerContext.builder().date(now).build();
-        var trigger = Trigger.of(triggerContext, now);
-        var conditionContext =conditionContext(scheduleOnDates);
+
+        TriggerContext triggerContext = TriggerContext.builder().date(now).build();
+        var conditionContext = conditionContext(scheduleOnDates);
 
         // when
-        ZonedDateTime nextDate = scheduleOnDates.nextEvaluationDate(conditionContext, Optional.of(trigger));
+        ZonedDateTime nextDate = scheduleOnDates.nextEvaluationDate(conditionContext, Optional.of(triggerContext));
 
         // then
         assertThat(nextDate).isEqualTo(after);
@@ -66,7 +72,6 @@ class ScheduleOnDatesTest {
         var scheduleOnDates = ScheduleOnDates.builder()
             .id(IdUtils.create())
             .type(ScheduleOnDates.class.getName())
-            .interval(null)
             .dates(Property.ofValue(List.of(before, after, later)))
             .build();
         var conditionContext = conditionContext(scheduleOnDates);
@@ -79,6 +84,66 @@ class ScheduleOnDatesTest {
     }
 
     @Test
+    public void shouldExposeTriggerDateInConfiguredTimezoneWhenEvaluate() throws Exception {
+        // Given
+        var fireDate = ZonedDateTime.parse("2025-05-01T17:15:00+02:00[Europe/Paris]");
+        var scheduleOnDates = ScheduleOnDates.builder()
+            .id(IdUtils.create())
+            .type(ScheduleOnDates.class.getName())
+            .timezone("Europe/Paris")
+            .dates(Property.ofValue(List.of(fireDate)))
+            .build();
+
+        var conditionContext = conditionContext(scheduleOnDates);
+        var triggerContext = TriggerContext.builder()
+            .namespace(conditionContext.getFlow().getNamespace())
+            .flowId(conditionContext.getFlow().getId())
+            .triggerId(scheduleOnDates.getId())
+            .date(fireDate)
+            .build();
+
+        // When
+        Optional<TriggerEvaluationResult> evaluate = scheduleOnDates.eval(conditionContext, triggerContext);
+
+        // Then
+        assertThat(evaluate).isPresent();
+        Map<String, Object> vars = evaluate.get().trigger().getVariables();
+        assertThat(vars).containsKey("date");
+        var renderedDate = ZonedDateTime.parse((String) vars.get("date"));
+        assertThat(renderedDate.toInstant()).isEqualTo(fireDate.toInstant());
+        assertThat(renderedDate.getOffset()).isEqualTo(ZoneId.of("Europe/Paris").getRules().getOffset(fireDate.toInstant()));
+    }
+
+    @Test
+    public void shouldExposeTriggerDateConvertedFromUtcToConfiguredTimezone() throws Exception {
+        // Given - dates declared in UTC, trigger configured in Asia/Tokyo
+        var fireDateUtc = ZonedDateTime.parse("2025-05-01T08:00:00Z");
+        var scheduleOnDates = ScheduleOnDates.builder()
+            .id(IdUtils.create())
+            .type(ScheduleOnDates.class.getName())
+            .timezone("Asia/Tokyo")
+            .dates(Property.ofValue(List.of(fireDateUtc)))
+            .build();
+
+        var conditionContext = conditionContext(scheduleOnDates);
+        var triggerContext = TriggerContext.builder()
+            .namespace(conditionContext.getFlow().getNamespace())
+            .flowId(conditionContext.getFlow().getId())
+            .triggerId(scheduleOnDates.getId())
+            .date(fireDateUtc)
+            .build();
+
+        // When
+        Optional<TriggerEvaluationResult> evaluate = scheduleOnDates.eval(conditionContext, triggerContext);
+
+        // Then - same instant, but rendered in Tokyo (+09:00)
+        assertThat(evaluate).isPresent();
+        var renderedDate = ZonedDateTime.parse((String) evaluate.get().trigger().getVariables().get("date"));
+        assertThat(renderedDate.toInstant()).isEqualTo(fireDateUtc.toInstant());
+        assertThat(renderedDate.getOffset()).isEqualTo(ZoneId.of("Asia/Tokyo").getRules().getOffset(fireDateUtc.toInstant()));
+    }
+
+    @Test
     public void shouldReturnPreviousDateWhenPreviousEvaluationDate() throws Exception {
         // given
         var now = ZonedDateTime.now();
@@ -88,16 +153,58 @@ class ScheduleOnDatesTest {
         var scheduleOnDates = ScheduleOnDates.builder()
             .id(IdUtils.create())
             .type(ScheduleOnDates.class.getName())
-            .interval(null)
             .dates(Property.ofValue(List.of(first, before, next)))
             .build();
         var conditionContext = conditionContext(scheduleOnDates);
 
         // when
-        ZonedDateTime previousDate = scheduleOnDates.previousEvaluationDate(conditionContext);
+        Optional<ZonedDateTime> previousDate = scheduleOnDates.previousEvaluationDate(conditionContext);
 
         // then
-        assertThat(previousDate).isEqualTo(before);
+        assertThat(previousDate).hasValue(before);
+    }
+
+    @Test
+    void shouldReturnEmptyWhenNoDateIsBeforeNow() throws Exception {
+        // given
+        var now = ZonedDateTime.now();
+        var scheduleOnDates = ScheduleOnDates.builder()
+            .id(IdUtils.create())
+            .type(ScheduleOnDates.class.getName())
+            .dates(Property.ofValue(List.of(now.plusMinutes(1), now.plusDays(1))))
+            .build();
+        var conditionContext = conditionContext(scheduleOnDates);
+
+        // when
+        Optional<ZonedDateTime> previousDate = scheduleOnDates.previousEvaluationDate(conditionContext);
+
+        // then
+        assertThat(previousDate).isEmpty();
+    }
+
+    @Test
+    void shouldReturnPreviousDateInTimezoneFromSchedulerClockWhenPreviousEvaluationDate() throws Exception {
+        // given
+        var first = ZonedDateTime.parse("2025-01-01T10:00:00.500Z");
+        var second = ZonedDateTime.parse("2025-01-02T10:00:00Z");
+        var scheduleOnDates = ScheduleOnDates.builder()
+            .id(IdUtils.create())
+            .type(ScheduleOnDates.class.getName())
+            .timezone("Asia/Tokyo")
+            .dates(Property.ofValue(List.of(second, first)))
+            .build();
+        var conditionContext = conditionContext(scheduleOnDates);
+        SchedulerClock.setClock(Clock.fixed(Instant.parse("2025-01-02T00:00:00Z"), ZoneId.systemDefault()));
+
+        try {
+            // when
+            Optional<ZonedDateTime> previousDate = scheduleOnDates.previousEvaluationDate(conditionContext);
+
+            // then
+            assertThat(previousDate).hasValue(ZonedDateTime.parse("2025-01-01T19:00:00+09:00[Asia/Tokyo]"));
+        } finally {
+            SchedulerClock.setClock(Clock.systemDefaultZone());
+        }
     }
 
     private ConditionContext conditionContext(AbstractTrigger trigger) {
@@ -110,10 +217,12 @@ class ScheduleOnDatesTest {
                     new Label("flow-label-2", "flow-label-2")
                 )
             )
-            .inputs(List.of(
-                StringInput.builder().id("input1").type(Type.STRING).required(false).build(),
-                StringInput.builder().id("input2").type(Type.STRING).defaults(Property.ofValue("default")).build()
-            ))
+            .inputs(
+                List.of(
+                    StringInput.builder().id("input1").type(Type.STRING).required(false).build(),
+                    StringInput.builder().id("input2").type(Type.STRING).defaults(Property.ofValue("default")).build()
+                )
+            )
             .build();
 
         TriggerContext triggerContext = TriggerContext.builder()

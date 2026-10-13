@@ -1,6 +1,11 @@
 package io.kestra.core.plugins;
 
+import java.util.Map;
+
+import org.junit.jupiter.api.Test;
+
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+
 import io.kestra.core.docs.JsonSchemaGenerator;
 import io.kestra.core.junit.annotations.ExecuteFlow;
 import io.kestra.core.junit.annotations.KestraTest;
@@ -11,13 +16,13 @@ import io.kestra.core.models.tasks.RunnableTask;
 import io.kestra.core.models.tasks.Task;
 import io.kestra.core.plugins.serdes.PluginDeserializer;
 import io.kestra.core.runners.RunContext;
+import io.kestra.core.services.TaskOutputService;
+
 import jakarta.inject.Inject;
 import jakarta.validation.constraints.NotNull;
 import lombok.*;
 import lombok.experimental.SuperBuilder;
-import org.junit.jupiter.api.Test;
-
-import java.util.Map;
+import tools.jackson.databind.ObjectMapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -27,21 +32,52 @@ class AdditionalPluginTest {
     @Inject
     private JsonSchemaGenerator jsonSchemaGenerator;
 
+    @Inject
+    private TaskOutputService taskOutputService;
+
+    @Inject
+    private ObjectMapper micronautMapper;
+
     @Test
     @ExecuteFlow("flows/valids/additional-plugin.yaml")
-    void additionalPlugin(Execution execution) {
+    void additionalPlugin(Execution execution) throws Exception {
         assertThat(execution).isNotNull();
         assertThat(execution.getState().isSuccess()).isTrue();
         assertThat(execution.getTaskRunList()).hasSize(2);
-        assertThat(execution.getTaskRunList().getFirst().getOutputs().get("output")).isEqualTo("1 -> Hello");
-        assertThat(execution.getTaskRunList().get(1).getOutputs().get("output")).isEqualTo("Hello World!");
+        assertThat(taskOutputService.getOutputs(execution.getTaskRunList().getFirst()).get("output")).isEqualTo("1 -> Hello");
+        assertThat(taskOutputService.getOutputs(execution.getTaskRunList().get(1)).get("output")).isEqualTo("Hello World!");
+    }
+
+    // Only Jackson3PluginModule's assignability match makes this work: see Jackson3PluginDeserializer.
+    @Test
+    void shouldDeserializeAnAdditionalPluginThroughTheMicronautMapper() {
+        String json = """
+            {"type":"%s","baseMessage":"Hello"}""".formatted(AdditionalPluginTest1.class.getName());
+
+        BaseAdditionalPluginTest plugin = micronautMapper.readValue(json, BaseAdditionalPluginTest.class);
+
+        assertThat(plugin).isInstanceOf(AdditionalPluginTest1.class);
+        assertThat(plugin.sayHello()).isEqualTo("1 -> Hello");
+    }
+
+    // Pins the abstract-only gate of that match: claiming concrete types too would make the deserializer
+    // re-invoke itself on the type it just resolved, until the stack runs out.
+    @Test
+    void shouldDeserializeAConcreteAdditionalPluginWithoutRecursing() {
+        String json = """
+            {"type":"%s","baseMessage":"Hello"}""".formatted(AdditionalPluginTest1.class.getName());
+
+        AdditionalPluginTest1 plugin = micronautMapper.readValue(json, AdditionalPluginTest1.class);
+
+        assertThat(plugin.sayHello()).isEqualTo("1 -> Hello");
     }
 
     @Test
     void shouldResolveAdditionalPluginSubtypes() {
         Map<String, Object> generate = jsonSchemaGenerator.properties(null, AdditionalPluginTest.AdditionalPluginTestTask.class);
         var definitions = (Map<String, Map<String, Object>>) generate.get("$defs");
-        assertThat(definitions).hasSize(10);
+        // the assets declaration of the task base counts the custom asset, the free-form branch of assets.outputs
+        assertThat(definitions).hasSize(11);
         assertThat(definitions).containsKey("io.kestra.core.plugins.AdditionalPluginTest-AdditionalPluginTest1");
         assertThat(definitions).containsKey("io.kestra.core.plugins.AdditionalPluginTest-AdditionalPluginTest2");
     }

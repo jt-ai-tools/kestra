@@ -1,20 +1,5 @@
 package io.kestra.core.runners.pebble.functions;
 
-import io.kestra.core.exceptions.IllegalVariableEvaluationException;
-import io.kestra.core.runners.LocalPath;
-import io.kestra.core.runners.VariableRenderer;
-import io.kestra.core.storages.Namespace;
-import io.kestra.core.storages.NamespaceFactory;
-import io.kestra.core.storages.StorageContext;
-import io.kestra.core.storages.StorageInterface;
-import io.kestra.core.utils.IdUtils;
-import io.kestra.core.utils.TestsUtils;
-import io.micronaut.context.annotation.Property;
-import io.micronaut.test.extensions.junit5.annotation.MicronautTest;
-import jakarta.inject.Inject;
-import org.junit.jupiter.api.Disabled;
-import org.junit.jupiter.api.Test;
-
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -24,8 +9,26 @@ import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.ExecutionMode;
+
+import io.kestra.core.exceptions.IllegalVariableEvaluationException;
+import io.kestra.core.runners.LocalPath;
+import io.kestra.core.runners.VariableRenderer;
+import io.kestra.core.storages.Namespace;
+import io.kestra.core.storages.NamespaceFactory;
+import io.kestra.core.storages.StorageContext;
+import io.kestra.core.storages.StorageInterface;
+import io.kestra.core.utils.IdUtils;
+import io.kestra.core.utils.TestsUtils;
+
+import io.micronaut.context.annotation.Property;
+import io.micronaut.test.extensions.junit5.annotation.MicronautTest;
+import io.pebbletemplates.pebble.error.PebbleException;
+import jakarta.inject.Inject;
 
 import static io.kestra.core.runners.pebble.functions.FunctionTestUtils.getVariables;
 import static io.kestra.core.runners.pebble.functions.FunctionTestUtils.getVariablesWithExecution;
@@ -34,7 +37,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @MicronautTest(rebuildContext = true)
-@Property(name="kestra.server-type", value="WORKER")
+@Property(name = "kestra.server-type", value = "STANDALONE")
 @Execution(ExecutionMode.SAME_THREAD)
 class ReadFileFunctionTest {
     @Inject
@@ -60,8 +63,8 @@ class ReadFileFunctionTest {
         URI nsFile = upsertNsFile(false, namespace, "Hello from version 1");
         upsertNsFile(nsFile.getPath(), false, namespace, "Hello from version 2");
 
-        // Version 2 will be deleted and should not be usable
-        Namespace namespaceStorage = namespaceFactory.of(MAIN_TENANT, namespace, storageInterface);
+        // Deleting the file takes every revision it holds at this point with it
+        Namespace namespaceStorage = namespaceFactory.of(MAIN_TENANT, namespace);
         namespaceStorage.delete(Path.of(nsFile.getPath()));
 
         // Upsert will remove the `deleted` flag and create a new version with the new content
@@ -70,11 +73,47 @@ class ReadFileFunctionTest {
         String render = variableRenderer.render("{{ render(read('" + nsFile.getPath() + "')) }}", getVariables(namespace));
         assertThat(render).isEqualTo("Hello from version 3");
 
-        IllegalVariableEvaluationException illegalVariableEvaluationException = assertThrows(IllegalVariableEvaluationException.class, () -> variableRenderer.render("{{ render(read('" + nsFile.getPath() + "', version=2)) }}", getVariables(namespace)));
+        IllegalVariableEvaluationException illegalVariableEvaluationException = assertThrows(
+            IllegalVariableEvaluationException.class, () -> variableRenderer.render("{{ render(read('" + nsFile.getPath() + "', revision=2)) }}", getVariables(namespace))
+        );
         assertThat(illegalVariableEvaluationException.getCause().getCause()).isInstanceOf(FileNotFoundException.class);
 
-        render = variableRenderer.render("{{ render(read('" + nsFile.getPath() + "', version=1)) }}", getVariables(namespace));
-        assertThat(render).isEqualTo("Hello from version 1");
+        // Revision 1 predates the deletion, so it goes with it: deleting the file deletes every revision it
+        // held at that point, and re-creating the path does not bring them back.
+        illegalVariableEvaluationException = assertThrows(
+            IllegalVariableEvaluationException.class, () -> variableRenderer.render("{{ render(read('" + nsFile.getPath() + "', revision=1)) }}", getVariables(namespace))
+        );
+        assertThat(illegalVariableEvaluationException.getCause().getCause()).isInstanceOf(FileNotFoundException.class);
+
+        // The revision written after the deletion is readable
+        render = variableRenderer.render("{{ render(read('" + nsFile.getPath() + "', revision=3)) }}", getVariables(namespace));
+        assertThat(render).isEqualTo("Hello from version 3");
+    }
+
+    @Test
+    void readNamespaceFileRejectsRemovedVersionArg() throws IOException, URISyntaxException {
+        String namespace = TestsUtils.randomNamespace();
+        URI nsFile = upsertNsFile(false, namespace, "Hello from version 1");
+
+        // The legacy 'version' argument was renamed to 'revision' in 2.0 - it must no longer be accepted
+        IllegalVariableEvaluationException exception = assertThrows(
+            IllegalVariableEvaluationException.class, () -> variableRenderer.render("{{ render(read('" + nsFile.getPath() + "', version=1)) }}", getVariables(namespace))
+        );
+        assertThat(exception.getCause()).isInstanceOf(PebbleException.class);
+        assertThat(exception.getCause().getMessage()).contains("The following named argument does not exist: version");
+    }
+
+    @Test
+    void readNamespaceFileRejectsNonIntegerRevision() throws IOException, URISyntaxException {
+        String namespace = TestsUtils.randomNamespace();
+        URI nsFile = upsertNsFile(false, namespace, "Hello from version 1");
+
+        IllegalVariableEvaluationException exception = assertThrows(
+            IllegalVariableEvaluationException.class,
+            () -> variableRenderer.render("{{ read('" + nsFile.getPath() + "', revision='not-a-number') }}", getVariables(namespace))
+        );
+        assertThat(exception.getCause().getCause()).isInstanceOf(IllegalArgumentException.class);
+        assertThat(exception.getCause().getCause().getMessage()).isEqualTo("The 'read' function expects the 'revision' argument to be a valid integer.");
     }
 
     @Test
@@ -82,7 +121,8 @@ class ReadFileFunctionTest {
         String namespace = TestsUtils.randomNamespace();
         String filePath = "file.txt";
         storageInterface.createDirectory(MAIN_TENANT, namespace, URI.create(StorageContext.namespaceFilePrefix(namespace)));
-        storageInterface.put(MAIN_TENANT, namespace, URI.create(StorageContext.namespaceFilePrefix(namespace) + "/" + filePath), new ByteArrayInputStream("Hello from {{ flow.namespace }}".getBytes()));
+        storageInterface
+            .put(MAIN_TENANT, namespace, URI.create(StorageContext.namespaceFilePrefix(namespace) + "/" + filePath), new ByteArrayInputStream("Hello from {{ flow.namespace }}".getBytes()));
 
         Map<String, Object> variables = getVariablesWithExecution(namespace);
 
@@ -100,7 +140,9 @@ class ReadFileFunctionTest {
 
     @Test
     void readUnknownNamespaceFile() {
-        IllegalVariableEvaluationException illegalVariableEvaluationException = assertThrows(IllegalVariableEvaluationException.class, () -> variableRenderer.render("{{ read('unknown.txt') }}", getVariables(TestsUtils.randomNamespace())));
+        IllegalVariableEvaluationException illegalVariableEvaluationException = assertThrows(
+            IllegalVariableEvaluationException.class, () -> variableRenderer.render("{{ read('unknown.txt') }}", getVariables(TestsUtils.randomNamespace()))
+        );
         assertThat(illegalVariableEvaluationException.getCause().getCause().getClass()).isEqualTo(FileNotFoundException.class);
     }
 
@@ -124,7 +166,8 @@ class ReadFileFunctionTest {
             "flow", Map.of(
                 "id", "subflow",
                 "namespace", namespace,
-                "tenantId", MAIN_TENANT),
+                "tenantId", MAIN_TENANT
+            ),
             "execution", Map.of("id", IdUtils.create()),
             "trigger", Map.of(
                 "flowId", flowId,
@@ -152,7 +195,8 @@ class ReadFileFunctionTest {
             "flow", Map.of(
                 "id", flowId,
                 "namespace", namespace,
-                "tenantId", MAIN_TENANT),
+                "tenantId", MAIN_TENANT
+            ),
             "execution", Map.of("id", executionId),
             "file", internalStorageFile
         );
@@ -165,7 +209,8 @@ class ReadFileFunctionTest {
             "flow", Map.of(
                 "id", "subflow",
                 "namespace", namespace,
-                "tenantId", MAIN_TENANT),
+                "tenantId", MAIN_TENANT
+            ),
             "execution", Map.of("id", IdUtils.create()),
             "trigger", Map.of(
                 "flowId", flowId,
@@ -194,10 +239,12 @@ class ReadFileFunctionTest {
     }
 
     @Test
-    @Property(name="kestra.server-type", value="EXECUTOR")
+    @Property(name = "kestra.server-type", value = "EXECUTOR")
     @Disabled("Moved on the next release")
     void readFailOnNonWorkerNodes() {
-        IllegalVariableEvaluationException exception = assertThrows(IllegalVariableEvaluationException.class, () -> variableRenderer.render("{{ read('unknown.txt') }}", Map.of("flow", Map.of("namespace", "io.kestra.tests"))));
+        IllegalVariableEvaluationException exception = assertThrows(
+            IllegalVariableEvaluationException.class, () -> variableRenderer.render("{{ read('unknown.txt') }}", Map.of("flow", Map.of("namespace", "io.kestra.tests")))
+        );
         assertThat(exception.getMessage()).contains("The 'read' function can only be used in the Worker as it access the internal storage.");
     }
 
@@ -205,7 +252,9 @@ class ReadFileFunctionTest {
     void shouldFailProcessingUnsupportedScheme() {
         Map<String, Object> variables = getVariablesWithExecution("notme", "notme");
 
-        assertThrows(IllegalArgumentException.class, () -> variableRenderer.render("{{ read('unsupported://path-to/file.txt') }}", variables));
+        var exception = assertThrows(IllegalVariableEvaluationException.class, () -> variableRenderer.render("{{ read('unsupported://path-to/file.txt') }}", variables));
+        assertThat(exception.getCause()).isInstanceOf(PebbleException.class);
+        assertThat(exception.getCause().getMessage()).contains("Cannot process the URI unsupported://path-to/file.txt: scheme not supported.");
     }
 
     @Test
@@ -215,12 +264,14 @@ class ReadFileFunctionTest {
             "flow", Map.of(
                 "id", "notme",
                 "namespace", "notme",
-                "tenantId", MAIN_TENANT),
+                "tenantId", MAIN_TENANT
+            ),
             "execution", Map.of("id", "notme"),
             "file", file.toString()
         );
 
-        assertThrows(SecurityException.class, () -> variableRenderer.render("{{ read(file) }}", variables));
+        var exception = assertThrows(IllegalVariableEvaluationException.class, () -> variableRenderer.render("{{ read(file) }}", variables));
+        assertThat(exception.getCause()).isInstanceOf(SecurityException.class);
     }
 
     @Test
@@ -231,7 +282,8 @@ class ReadFileFunctionTest {
             "flow", Map.of(
                 "id", "notme",
                 "namespace", "notme",
-                "tenantId", MAIN_TENANT),
+                "tenantId", MAIN_TENANT
+            ),
             "execution", Map.of("id", "notme"),
             "file", file.toString()
         );
@@ -248,12 +300,14 @@ class ReadFileFunctionTest {
             "flow", Map.of(
                 "id", "notme",
                 "namespace", "notme",
-                "tenantId", MAIN_TENANT),
+                "tenantId", MAIN_TENANT
+            ),
             "execution", Map.of("id", "notme"),
             "file", file.toString()
         );
 
-        assertThrows(SecurityException.class, () -> variableRenderer.render("{{ read(file) }}", variables));
+        var exception = assertThrows(IllegalVariableEvaluationException.class, () -> variableRenderer.render("{{ read(file) }}", variables));
+        assertThat(exception.getCause()).isInstanceOf(SecurityException.class);
     }
 
     @Test
@@ -263,7 +317,8 @@ class ReadFileFunctionTest {
             "flow", Map.of(
                 "id", "flow",
                 "namespace", "io.kestra.tests",
-                "tenantId", MAIN_TENANT),
+                "tenantId", MAIN_TENANT
+            ),
             "execution", Map.of("id", "execution"),
             "nsfile", file.toString()
         );
@@ -278,7 +333,8 @@ class ReadFileFunctionTest {
             "flow", Map.of(
                 "id", "flow",
                 "namespace", "notme",
-                "tenantId", MAIN_TENANT),
+                "tenantId", MAIN_TENANT
+            ),
             "execution", Map.of("id", "execution"),
             "nsfile", file.toString()
         );
@@ -298,7 +354,8 @@ class ReadFileFunctionTest {
             "flow", Map.of(
                 "id", "flow",
                 "namespace", "notme",
-                "tenantId", MAIN_TENANT),
+                "tenantId", MAIN_TENANT
+            ),
             "execution", Map.of("id", "notme"),
             "trigger", Map.of("namespace", "notme", "flowId", "parent", "executionId", "parent")
         );
@@ -308,7 +365,7 @@ class ReadFileFunctionTest {
     }
 
     private URI createFile() throws IOException {
-        File tempFile = File.createTempFile("file", ".txt");
+        File tempFile = Files.createTempFile(Path.of("/tmp"), "file", ".txt").toFile();
         Files.write(tempFile.toPath(), "Hello World".getBytes());
         return tempFile.toPath().toUri();
     }
@@ -318,7 +375,7 @@ class ReadFileFunctionTest {
     }
 
     private URI upsertNsFile(String filePath, boolean nsInAuthority, String namespace, String value) throws IOException, URISyntaxException {
-        Namespace namespaceStorage = namespaceFactory.of(MAIN_TENANT, namespace, storageInterface);
+        Namespace namespaceStorage = namespaceFactory.of(MAIN_TENANT, namespace);
         namespaceStorage.putFile(Path.of("/" + filePath), new ByteArrayInputStream(value.getBytes()));
         return URI.create("nsfile://" + (nsInAuthority ? namespace : "") + "/" + filePath);
     }

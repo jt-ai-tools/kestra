@@ -1,5 +1,16 @@
 package io.kestra.core.docs;
 
+import java.lang.reflect.*;
+import java.time.Duration;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
+
 import com.fasterxml.classmate.ResolvedType;
 import com.fasterxml.classmate.members.HierarchicType;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
@@ -20,12 +31,12 @@ import com.github.victools.jsonschema.module.jakarta.validation.JakartaValidatio
 import com.github.victools.jsonschema.module.jakarta.validation.JakartaValidationOption;
 import com.github.victools.jsonschema.module.swagger2.Swagger2Module;
 import com.google.common.collect.ImmutableMap;
+
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.annotations.PluginProperty;
 import io.kestra.core.models.assets.Asset;
 import io.kestra.core.models.assets.AssetExporter;
-import io.kestra.core.models.conditions.Condition;
-import io.kestra.core.models.conditions.ScheduleCondition;
+import io.kestra.core.models.assets.Custom;
 import io.kestra.core.models.dashboards.DataFilter;
 import io.kestra.core.models.dashboards.DataFilterKPI;
 import io.kestra.core.models.dashboards.charts.Chart;
@@ -43,7 +54,10 @@ import io.kestra.core.models.triggers.AbstractTrigger;
 import io.kestra.core.plugins.AdditionalPlugin;
 import io.kestra.core.plugins.PluginRegistry;
 import io.kestra.core.plugins.RegisteredPlugin;
+import io.kestra.core.preview.FileRenderer;
 import io.kestra.core.serializers.JacksonMapper;
+import io.kestra.core.validations.TimezoneId;
+
 import io.micronaut.core.annotation.Nullable;
 import io.swagger.v3.oas.annotations.Hidden;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -51,14 +65,6 @@ import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
-
-import java.lang.reflect.*;
-import java.time.Duration;
-import java.time.LocalTime;
-import java.util.*;
-import java.util.function.Predicate;
-import java.util.stream.Collectors;
-import java.util.stream.StreamSupport;
 
 import static io.kestra.core.docs.AbstractClassDocumentation.flattenWithoutType;
 import static io.kestra.core.docs.AbstractClassDocumentation.required;
@@ -76,6 +82,18 @@ public class JsonSchemaGenerator {
     private static final ObjectMapper YAML_MAPPER = JacksonMapper.ofYaml().copy()
         .configure(SerializationFeature.WRITE_DURATIONS_AS_TIMESTAMPS, false);
 
+    private static final List<String> AVAILABLE_ZONE_IDS = Stream
+        .concat(ZoneId.getAvailableZoneIds().stream(), ZoneId.SHORT_IDS.keySet().stream())
+        .distinct()
+        .sorted()
+        .toList();
+
+    // Matches the offset-style timezone strings ZoneId.of() accepts but that are not in getAvailableZoneIds():
+    // `Z`, `+HH[:MM[:SS]]`, and `(UTC|GMT|UT)[+-]HH[:MM[:SS]]`.
+    private static final String TIMEZONE_OFFSET_PATTERN = "^(Z|[+-]\\d{2}(:?\\d{2})?(:?\\d{2})?|(UTC|GMT|UT)[+-]\\d{2}(:?\\d{2})?(:?\\d{2})?)$";
+    // A value holding a Pebble expression, accepted next to the literal format of an output asset property.
+    private static final String PEBBLE_EXPRESSION_PATTERN = ".*\\{\\{.*\\}\\}.*";
+
     private final PluginRegistry pluginRegistry;
 
     @Inject
@@ -83,14 +101,15 @@ public class JsonSchemaGenerator {
         this.pluginRegistry = pluginRegistry;
     }
 
-    Map<Class<?>, Object> defaultInstances = new HashMap<>();
+    Map<Class<?>, Object> defaultInstances = new ConcurrentHashMap<>();
 
     public <T> Map<String, Object> schemas(Class<? extends T> cls) {
         return this.schemas(cls, false);
     }
 
     private void replaceOneOfWithAnyOf(ObjectNode objectNode) {
-        objectNode.findParents("oneOf").forEach(jsonNode -> {
+        objectNode.findParents("oneOf").forEach(jsonNode ->
+        {
             if (jsonNode instanceof ObjectNode oNode) {
                 oNode.set("anyOf", oNode.remove("oneOf"));
             }
@@ -125,20 +144,286 @@ public class JsonSchemaGenerator {
             pullDocumentationAndDefaultFromAnyOf(objectNode);
             removeRequiredOnPropsWithDefaults(objectNode);
 
+            // Strip edition-restricted input types before collapsing discriminator wrappers: the
+            // strip logic removes a whole allOf branch (the one carrying the `type` const), which
+            // only works while that branch is still a separate array entry. Collapsing first would
+            // inline it into a flat object, leaving no branch for the strip step to remove.
+            Map<String, Object> schema = MAPPER.convertValue(objectNode, MAP_TYPE_REFERENCE);
+            stripEditionRestrictedInputTypes(schema, cls);
+
+            objectNode = MAPPER.convertValue(schema, ObjectNode.class);
+            collapseSingleUseDiscriminatorWrappers(objectNode);
+
             return MAPPER.convertValue(objectNode, MAP_TYPE_REFERENCE);
         } catch (Exception e) {
             throw new IllegalArgumentException("Unable to generate jsonschema for '" + cls.getName() + "'", e);
         }
     }
 
+    /**
+     * Strip edition-restricted input types (those excluded by {@link #includeInputSubtype}, i.e. {@code @EeOnly} ones
+     * such as {@code REUSABLE_INPUTS}) from the generated flow schema. The {@code Type} enum is carried in two places:
+     * the {@code enum} arrays (the {@code type} discriminator and {@code ArrayInput.itemType}) AND the polymorphic
+     * {@code anyOf}/{@code oneOf}/{@code allOf} discriminator branches ({@code {properties:{type:{const:...}}}}); both
+     * must be pruned, along with the subtype's own definitions — a branch reaching one by {@code $ref} keeps
+     * validating the excluded input, only without the {@code type} that identifies it. Open-source removes the
+     * {@code @EeOnly} types; the Enterprise override of {@code includeInputSubtype} keeps them all, so the excluded
+     * set is empty here (no-op).
+     */
+    private void stripEditionRestrictedInputTypes(Map<String, Object> schema, Class<?> cls) {
+        Set<String> excluded = this.excludedInputTypes(cls);
+
+        if (excluded.isEmpty()) {
+            return;
+        }
+
+        // the subtype definitions have to be spotted first: the strip below removes the discriminator branch that
+        // tells them apart from an ordinary input definition
+        Set<String> excludedDefinitions = excludedSubtypeDefinitions(schema, excluded);
+
+        stripEditionRestrictedInputTypes(schema, excluded, excludedDefinitions);
+        removeExcludedDefinitions(schema, excludedDefinitions);
+    }
+
+    /**
+     * The input type names to strip from the schema generated for {@code cls}, by default the ones
+     * {@link #includeInputSubtype} rejects for this edition. Override to exclude a type for one schema only; it is
+     * applied before discriminator wrappers are collapsed, which a caller stripping the returned map cannot do.
+     */
+    protected Set<String> excludedInputTypes(Class<?> cls) {
+        return Arrays.stream(io.kestra.core.models.flows.Type.values())
+            .filter(type -> !this.includeInputSubtype(type.cls()))
+            .map(Enum::name)
+            .collect(Collectors.toSet());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void stripEditionRestrictedInputTypes(Object node, Set<String> excluded, Set<String> excludedDefinitions) {
+        if (node instanceof Map<?, ?> rawMap) {
+            Map<String, Object> map = (Map<String, Object>) rawMap;
+
+            if (map.get("enum") instanceof List<?> enumValues) {
+                enumValues.removeIf(value -> excluded.contains(String.valueOf(value)));
+            }
+            for (String key : List.of("anyOf", "oneOf", "allOf")) {
+                if (map.get(key) instanceof List<?> branches) {
+                    branches.removeIf(
+                        branch -> isExcludedDiscriminatorBranch(branch, excluded)
+                            || referencesExcludedDefinition(branch, excludedDefinitions)
+                    );
+                }
+            }
+            map.values().forEach(value -> stripEditionRestrictedInputTypes(value, excluded, excludedDefinitions));
+        } else if (node instanceof List<?> list) {
+            list.forEach(value -> stripEditionRestrictedInputTypes(value, excluded, excludedDefinitions));
+        }
+    }
+
+    /** The definitions of the excluded subtypes: the discriminator branch itself, or the wrapper carrying it. */
+    @SuppressWarnings("unchecked")
+    private static Set<String> excludedSubtypeDefinitions(Map<String, Object> schema, Set<String> excluded) {
+        if (!(schema.get("definitions") instanceof Map<?, ?> definitions)) {
+            return Set.of();
+        }
+
+        return ((Map<String, Object>) definitions).entrySet().stream()
+            .filter(entry -> isExcludedSubtypeDefinition(entry.getValue(), excluded))
+            .map(Map.Entry::getKey)
+            .collect(Collectors.toSet());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static boolean isExcludedSubtypeDefinition(Object definition, Set<String> excluded) {
+        if (isExcludedDiscriminatorBranch(definition, excluded)) {
+            return true;
+        }
+        if (!(definition instanceof Map<?, ?> map)) {
+            return false;
+        }
+
+        for (String key : List.of("anyOf", "oneOf", "allOf")) {
+            if (
+                ((Map<String, Object>) map).get(key) instanceof List<?> branches
+                    && branches.stream().anyMatch(branch -> isExcludedDiscriminatorBranch(branch, excluded))
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Drops the excluded subtype definitions, then whatever only they referenced: a discriminator wrapper points at a
+     * plain body definition no other subtype uses, while shared ones (e.g. {@code DependsOn}) stay referenced.
+     */
+    @SuppressWarnings("unchecked")
+    private static void removeExcludedDefinitions(Map<String, Object> schema, Set<String> excludedDefinitions) {
+        if (excludedDefinitions.isEmpty() || !(schema.get("definitions") instanceof Map<?, ?> rawDefinitions)) {
+            return;
+        }
+
+        Map<String, Object> definitions = (Map<String, Object>) rawDefinitions;
+        Set<String> orphanCandidates = new HashSet<>();
+        excludedDefinitions.forEach(name -> collectRefs(definitions.remove(name), orphanCandidates));
+
+        boolean removedAny = true;
+        while (removedAny) {
+            removedAny = false;
+            Set<String> referenced = new HashSet<>();
+            collectRefs(schema, referenced);
+
+            for (String candidate : Set.copyOf(orphanCandidates)) {
+                if (!referenced.contains(candidate) && definitions.containsKey(candidate)) {
+                    orphanCandidates.remove(candidate);
+                    collectRefs(definitions.remove(candidate), orphanCandidates);
+                    removedAny = true;
+                }
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static boolean referencesExcludedDefinition(Object node, Set<String> definitions) {
+        return node instanceof Map<?, ?> map
+            && ((Map<String, Object>) map).get("$ref") instanceof String ref
+            && definitions.contains(definitionName(ref));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void collectRefs(Object node, Set<String> refs) {
+        if (node instanceof Map<?, ?> rawMap) {
+            Map<String, Object> map = (Map<String, Object>) rawMap;
+
+            if (map.get("$ref") instanceof String ref) {
+                refs.add(definitionName(ref));
+            }
+            map.values().forEach(value -> collectRefs(value, refs));
+        } else if (node instanceof List<?> list) {
+            list.forEach(value -> collectRefs(value, refs));
+        }
+    }
+
+    private static String definitionName(String ref) {
+        return ref.substring(ref.lastIndexOf('/') + 1);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static boolean isExcludedDiscriminatorBranch(Object branch, Set<String> excluded) {
+        if (
+            branch instanceof Map<?, ?> map
+                && ((Map<String, Object>) map).get("properties") instanceof Map<?, ?> properties
+                && ((Map<String, Object>) properties).get("type") instanceof Map<?, ?> type
+        ) {
+            return excluded.contains(String.valueOf(((Map<String, Object>) type).get("const")));
+        }
+        return false;
+    }
+
+    /**
+     * For a polymorphic property, the generator emits two definitions per subtype: a plain
+     * {@code <Class>} object, and a {@code <Class>-2} wrapper ({@code allOf: [{$ref: <Class>-1}, {
+     * required: ["type"], ...}]}) carrying the discriminator {@code required} needed to use it as
+     * an {@code anyOf} branch. When the plain definition is referenced from nowhere else, keeping
+     * it separate only adds an indirection with no reuse benefit — inline it into its wrapper and
+     * drop it, cutting the schema's definition count without changing what it validates.
+     */
+    private void collapseSingleUseDiscriminatorWrappers(ObjectNode objectNode) {
+        if (!(objectNode.get("definitions") instanceof ObjectNode definitions)) {
+            return;
+        }
+
+        Map<String, Integer> refCounts = new HashMap<>();
+        countRefs(objectNode, refCounts);
+
+        List<String> baseKeysToRemove = new ArrayList<>();
+        definitions.properties().forEach(entry ->
+        {
+            String wrapperKey = entry.getKey();
+            if (
+                !(entry.getValue() instanceof ObjectNode wrapper)
+                    || !(wrapper.get("allOf") instanceof ArrayNode allOf) || allOf.size() != 2
+                    || !(allOf.get(0) instanceof ObjectNode firstBranch) || firstBranch.size() != 1
+                    || !(firstBranch.get("$ref") instanceof TextNode refNode)
+                    || !(allOf.get(1) instanceof ObjectNode extra)
+            ) {
+                return;
+            }
+
+            String ref = refNode.asText();
+            String baseKey = ref.substring(ref.lastIndexOf('/') + 1);
+            if (
+                baseKey.equals(wrapperKey)
+                    || !(definitions.get(baseKey) instanceof ObjectNode base)
+                    || refCounts.getOrDefault(ref, 0) != 1
+            ) {
+                return;
+            }
+
+            definitions.set(wrapperKey, mergeAllOfBranches(base, extra));
+            baseKeysToRemove.add(baseKey);
+        });
+
+        baseKeysToRemove.forEach(definitions::remove);
+    }
+
+    /** Merges {@code extra} onto a copy of {@code base}, unioning {@code properties}/{@code required} instead of overwriting them. */
+    private static ObjectNode mergeAllOfBranches(ObjectNode base, ObjectNode extra) {
+        ObjectNode merged = base.deepCopy();
+        extra.properties().forEach(entry ->
+        {
+            String key = entry.getKey();
+            JsonNode extraValue = entry.getValue();
+
+            if (key.equals("properties") && merged.get("properties") instanceof ObjectNode baseProps && extraValue instanceof ObjectNode extraProps) {
+                ObjectNode mergedProps = baseProps.deepCopy();
+                extraProps.properties().forEach(p -> mergedProps.set(p.getKey(), p.getValue()));
+                merged.set("properties", mergedProps);
+            } else if (key.equals("required") && merged.get("required") instanceof ArrayNode baseRequired && extraValue instanceof ArrayNode extraRequired) {
+                ArrayNode mergedRequired = baseRequired.deepCopy();
+                Set<String> existing = new HashSet<>();
+                mergedRequired.forEach(n -> existing.add(n.asText()));
+                extraRequired.forEach(n ->
+                {
+                    if (existing.add(n.asText())) {
+                        mergedRequired.add(n);
+                    }
+                });
+                merged.set("required", mergedRequired);
+            } else {
+                merged.set(key, extraValue);
+            }
+        });
+        return merged;
+    }
+
+    private static void countRefs(JsonNode node, Map<String, Integer> counts) {
+        if (node instanceof ObjectNode obj) {
+            obj.properties().forEach(entry ->
+            {
+                if (entry.getKey().equals("$ref") && entry.getValue() instanceof TextNode ref) {
+                    counts.merge(ref.asText(), 1, Integer::sum);
+                } else {
+                    countRefs(entry.getValue(), counts);
+                }
+            });
+        } else if (node instanceof ArrayNode arr) {
+            arr.forEach(child -> countRefs(child, counts));
+        }
+    }
+
     private void removeRequiredOnPropsWithDefaults(ObjectNode objectNode) {
-        objectNode.findParents("required").forEach(jsonNode -> {
-            if (jsonNode instanceof ObjectNode clazzSchema && clazzSchema.get("required") instanceof ArrayNode requiredPropsNode && clazzSchema.get("properties") instanceof ObjectNode properties) {
+        objectNode.findParents("required").forEach(jsonNode ->
+        {
+            if (
+                jsonNode instanceof ObjectNode clazzSchema && clazzSchema.get("required") instanceof ArrayNode requiredPropsNode
+                    && clazzSchema.get("properties") instanceof ObjectNode properties
+            ) {
                 List<String> requiredFieldValues = StreamSupport.stream(requiredPropsNode.spliterator(), false)
                     .map(JsonNode::asText)
                     .collect(Collectors.toList());
 
-                properties.fields().forEachRemaining(e -> {
+                properties.properties().forEach(e ->
+                {
                     int indexInRequiredArray = requiredFieldValues.indexOf(e.getKey());
                     if (indexInRequiredArray != -1 && e.getValue() instanceof ObjectNode valueNode && valueNode.has("default")) {
                         requiredPropsNode.remove(indexInRequiredArray);
@@ -154,7 +439,8 @@ public class JsonSchemaGenerator {
 
         // do the same for all definitions
         if (objectNode.get("definitions") instanceof ObjectNode definitions) {
-            definitions.forEach(jsonNode -> {
+            definitions.forEach(jsonNode ->
+            {
                 if (jsonNode instanceof ObjectNode definition) {
                     removeRequiredOnPropsWithDefaults(definition);
                 }
@@ -167,27 +453,36 @@ public class JsonSchemaGenerator {
     // So, we pull off the 'default' from any of the anyOf to the parent.
     // same thing for documentation fields: 'title', 'description', '$deprecated'
     private void pullDocumentationAndDefaultFromAnyOf(ObjectNode objectNode) {
-        objectNode.findParents("anyOf").forEach(jsonNode -> {
+        objectNode.findParents("anyOf").forEach(jsonNode ->
+        {
             if (jsonNode instanceof ObjectNode oNode) {
                 JsonNode anyOf = oNode.get("anyOf");
                 if (anyOf instanceof ArrayNode arrayNode) {
                     Iterator<JsonNode> it = arrayNode.elements();
-                    var nodesToPullUp = new HashMap<String, Optional<JsonNode>>(Map.ofEntries(
-                        Map.entry("default", Optional.empty()),
-                        Map.entry("title", Optional.empty()),
-                        Map.entry("description", Optional.empty()),
-                        Map.entry("$deprecated", Optional.empty())
-                    ));
+                    var nodesToPullUp = new HashMap<String, Optional<JsonNode>>(
+                        Map.ofEntries(
+                            Map.entry("default", Optional.empty()),
+                            Map.entry("title", Optional.empty()),
+                            Map.entry("description", Optional.empty()),
+                            Map.entry("$deprecated", Optional.empty()),
+                            Map.entry("$group", Optional.empty()),
+                            Map.entry("$index", Optional.empty())
+                        )
+                    );
                     // find nodes to pull up
-                    while (it.hasNext() && nodesToPullUp.containsValue(Optional.<JsonNode>empty())) {
+                    while (it.hasNext() && nodesToPullUp.containsValue(Optional.<JsonNode> empty())) {
                         JsonNode next = it.next();
                         if (next instanceof ObjectNode nextAsObj) {
                             nodesToPullUp.entrySet().stream()
                                 .filter(node -> node.getValue().isEmpty())
-                                .forEach(node -> node
-                                    .setValue(Optional.ofNullable(
-                                        nextAsObj.get(node.getKey())
-                                    )));
+                                .forEach(
+                                    node -> node
+                                        .setValue(
+                                            Optional.ofNullable(
+                                                nextAsObj.get(node.getKey())
+                                            )
+                                        )
+                                );
                         }
                     }
                     // create nodes on parent
@@ -267,18 +562,41 @@ public class JsonSchemaGenerator {
     }
 
     protected void build(SchemaGeneratorConfigBuilder builder, boolean draft7, List<String> allowedPluginTypes, boolean withOutputs) {
-//        builder.withObjectMapper(builder.getObjectMapper().configure(SerializationFeature.WRITE_DURATIONS_AS_TIMESTAMPS, false));
+        //        builder.withObjectMapper(builder.getObjectMapper().configure(SerializationFeature.WRITE_DURATIONS_AS_TIMESTAMPS, false));
         builder
-            .with(new JakartaValidationModule(
-                JakartaValidationOption.NOT_NULLABLE_METHOD_IS_REQUIRED,
-                JakartaValidationOption.NOT_NULLABLE_FIELD_IS_REQUIRED,
-                JakartaValidationOption.INCLUDE_PATTERN_EXPRESSIONS
-            ))
-            .with(new Swagger2Module())
+            .with(
+                new JakartaValidationModule(
+                    JakartaValidationOption.NOT_NULLABLE_METHOD_IS_REQUIRED,
+                    JakartaValidationOption.NOT_NULLABLE_FIELD_IS_REQUIRED,
+                    JakartaValidationOption.INCLUDE_PATTERN_EXPRESSIONS
+                )
+            )
+            .with(new Swagger2Module() {
+                @Override
+                protected List<ResolvedType> resolveTargetTypeOverrides(MemberScope<?, ?> member) {
+                    Schema schema = member.getAnnotationConsideringFieldAndGetter(Schema.class);
+                    if (
+                        schema != null && schema.implementation() == Object.class
+                            && member.getDeclaredType().getErasedType() == io.kestra.core.models.tasks.retrys.AbstractRetry.class
+                    ) {
+                        return null;
+                    }
+                    return super.resolveTargetTypeOverrides(member);
+                }
+
+                @Override
+                protected String resolveDefault(MemberScope<?, ?> member) {
+                    // swagger-annotations since 2.2.46 returns this sentinel rather than "" for an unset
+                    // @Schema.defaultValue, which victools's emptiness check treats as a declared default.
+                    String resolved = super.resolveDefault(member);
+                    return "##default".equals(resolved) ? null : resolved;
+                }
+            })
             .with(Option.DEFINITIONS_FOR_ALL_OBJECTS)
             .with(Option.DEFINITION_FOR_MAIN_SCHEMA)
             .with(Option.PLAIN_DEFINITION_KEYS)
-            .with(Option.ALLOF_CLEANUP_AT_THE_END);
+            .with(Option.ALLOF_CLEANUP_AT_THE_END)
+            .without(Option.FLATTENED_OPTIONALS);
 
         // HACK: Registered a custom JsonUnwrappedDefinitionProvider prior to the JacksonModule
         // to be able to return an CustomDefinition with an empty node when the ResolvedType can't be found.
@@ -347,7 +665,8 @@ public class JsonSchemaGenerator {
             });
 
         // resolve dynamic types from Property and make EncryptedString looks like a string
-        builder.forFields().withTargetTypeOverridesResolver(target -> {
+        builder.forFields().withTargetTypeOverridesResolver(target ->
+        {
             ResolvedType javaType = target.getType();
             if (javaType.isInstanceOf(Property.class)) {
                 TypeContext context = target.getContext();
@@ -380,13 +699,19 @@ public class JsonSchemaGenerator {
                 return List.of(
                     context.resolve(String.class)
                 );
+            } else if (javaType.isInstanceOf(Optional.class) && !javaType.getTypeParameters().isEmpty()) {
+                // Unwrap Optional<T> to T to avoid null type in schema
+                return List.of(
+                    javaType.getTypeParameters().getFirst()
+                );
             }
 
             return null;
         });
 
         // PluginProperty $dynamic && deprecated swagger properties
-        builder.forFields().withInstanceAttributeOverride((memberAttributes, member, context) -> {
+        builder.forFields().withInstanceAttributeOverride((memberAttributes, member, context) ->
+        {
             PluginProperty pluginPropertyAnnotation = member.getAnnotationConsideringFieldAndGetter(PluginProperty.class);
             if (pluginPropertyAnnotation != null) {
                 memberAttributes.put("$dynamic", pluginPropertyAnnotation.dynamic());
@@ -401,6 +726,12 @@ public class JsonSchemaGenerator {
                 }
                 if (!pluginPropertyAnnotation.group().isEmpty()) {
                     memberAttributes.put("$group", pluginPropertyAnnotation.group());
+                }
+                if (pluginPropertyAnnotation.secret()) {
+                    memberAttributes.put("$secret", true);
+                }
+                if (pluginPropertyAnnotation.index() != -1) {
+                    memberAttributes.put("$index", pluginPropertyAnnotation.index());
                 }
             }
 
@@ -419,27 +750,66 @@ public class JsonSchemaGenerator {
                 // if we are in the String definition of a Property but the target type is not String: we configure the pattern
                 // TODO this was a good idea but their is too much cases where it didn't work like in List or Map so if we want it we need to make it more clever
                 //  I keep it for now commented but at some point we may want to re-do and improve it or remove these commented lines
-//                Class<?> targetType = member.getDeclaredType().getTypeParameters().getFirst().getErasedType();
-//                if (!String.class.isAssignableFrom(targetType) && String.class.isAssignableFrom(member.getType().getErasedType())) {
-//                    memberAttributes.put("pattern", ".*{{.*}}.*");
-//                }
+                //                Class<?> targetType = member.getDeclaredType().getTypeParameters().getFirst().getErasedType();
+                //                if (!String.class.isAssignableFrom(targetType) && String.class.isAssignableFrom(member.getType().getErasedType())) {
+                //                    memberAttributes.put("pattern", ".*{{.*}}.*");
+                //                }
             } else if (member.getDeclaredType().isInstanceOf(Data.class)) {
                 memberAttributes.put("$dynamic", false);
             }
         });
 
+        // On @TimezoneId-annotated fields, expose ZoneId IDs for autocomplete while still accepting offset forms
+        // (e.g. `+02:00`, `GMT-05:00`) that ZoneId.of() parses but that are not in getAvailableZoneIds().
+        builder.forFields().withInstanceAttributeOverride((memberAttributes, member, context) ->
+        {
+            if (member.getAnnotationConsideringFieldAndGetter(TimezoneId.class) == null) {
+                return;
+            }
+            ArrayNode enumNode = context.getGeneratorConfig().createArrayNode();
+            AVAILABLE_ZONE_IDS.forEach(enumNode::add);
+            ObjectNode enumBranch = context.getGeneratorConfig().createObjectNode();
+            enumBranch.set("enum", enumNode);
+            ObjectNode patternBranch = context.getGeneratorConfig().createObjectNode();
+            patternBranch.put("pattern", TIMEZONE_OFFSET_PATTERN);
+            ArrayNode anyOf = context.getGeneratorConfig().createArrayNode();
+            anyOf.add(enumBranch);
+            anyOf.add(patternBranch);
+            memberAttributes.set("anyOf", anyOf);
+        });
+
+        // The output assets of a task are declared through a Property<List<Asset>>: the whole declaration is rendered
+        // at runtime, so any asset property may hold a Pebble expression, as in `namespace: "{{ flow.namespace }}"`.
+        // Keep the format of a @Pattern-constrained property for literals, but accept an expression next to it.
+        builder.forFields().withInstanceAttributeOverride((memberAttributes, member, context) ->
+        {
+            if (!Asset.class.isAssignableFrom(member.getDeclaringType().getErasedType()) || !memberAttributes.has("pattern")) {
+                return;
+            }
+            ObjectNode literalBranch = context.getGeneratorConfig().createObjectNode();
+            literalBranch.set("pattern", memberAttributes.remove("pattern"));
+            ObjectNode expressionBranch = context.getGeneratorConfig().createObjectNode();
+            expressionBranch.put("pattern", PEBBLE_EXPRESSION_PATTERN);
+            ArrayNode anyOf = context.getGeneratorConfig().createArrayNode();
+            anyOf.add(literalBranch);
+            anyOf.add(expressionBranch);
+            memberAttributes.set("anyOf", anyOf);
+        });
+
         // Add Plugin annotation special docs
         builder.forTypesInGeneral()
-            .withTypeAttributeOverride((collectedTypeAttributes, scope, context) -> {
+            .withTypeAttributeOverride((collectedTypeAttributes, scope, context) ->
+            {
                 Plugin pluginAnnotation = scope.getType().getErasedType().getAnnotation(Plugin.class);
                 if (pluginAnnotation != null) {
                     List<ObjectNode> examples = Arrays
                         .stream(pluginAnnotation.examples())
-                        .map(example -> context.getGeneratorConfig().createObjectNode()
-                            .put("full", example.full())
-                            .put("code", String.join("\n", example.code()))
-                            .put("lang", example.lang())
-                            .put("title", example.title())
+                        .map(
+                            example -> context.getGeneratorConfig().createObjectNode()
+                                .put("full", example.full())
+                                .put("code", String.join("\n", example.code()))
+                                .put("lang", example.lang())
+                                .put("title", example.title())
                         )
                         .toList();
 
@@ -449,11 +819,12 @@ public class JsonSchemaGenerator {
 
                     List<ObjectNode> metrics = Arrays
                         .stream(pluginAnnotation.metrics())
-                        .map(metric -> context.getGeneratorConfig().createObjectNode()
-                            .put("name", metric.name())
-                            .put("type", metric.type())
-                            .put("unit", metric.unit())
-                            .put("description", metric.description())
+                        .map(
+                            metric -> context.getGeneratorConfig().createObjectNode()
+                                .put("name", metric.name())
+                                .put("type", metric.type())
+                                .put("unit", metric.unit())
+                                .put("description", metric.description())
                         )
                         .toList();
 
@@ -467,9 +838,11 @@ public class JsonSchemaGenerator {
 
                     if (withOutputs) {
                         Map<String, Object> outputsSchema = this.outputs(null, scope.getType().getErasedType());
-                        collectedTypeAttributes.set("outputs", context.getGeneratorConfig().createObjectNode().pojoNode(
-                            flattenWithoutType(AbstractClassDocumentation.properties(outputsSchema), required(outputsSchema))
-                        ));
+                        collectedTypeAttributes.set(
+                            "outputs", context.getGeneratorConfig().createObjectNode().pojoNode(
+                                flattenWithoutType(AbstractClassDocumentation.properties(outputsSchema), required(outputsSchema))
+                            )
+                        );
                     }
                 }
 
@@ -481,7 +854,8 @@ public class JsonSchemaGenerator {
                 }
             });
 
-        builder.forFields().withAdditionalPropertiesResolver(target -> {
+        builder.forFields().withAdditionalPropertiesResolver(target ->
+        {
             PluginProperty pluginPropertyAnnotation = target.getAnnotationConsideringFieldAndGetter(PluginProperty.class);
             Schema schemaAnnotation = target.getAnnotationConsideringFieldAndGetter(Schema.class);
             Content contentAnnotation = target.getAnnotationConsideringFieldAndGetter(Content.class);
@@ -503,29 +877,36 @@ public class JsonSchemaGenerator {
         if (builder.build().getSchemaVersion() != SchemaVersion.DRAFT_2019_09) {
             // Subtype resolver for all plugins
             builder.forTypesInGeneral()
-                .withSubtypeResolver((declaredType, context) -> {
+                .withSubtypeResolver((declaredType, context) ->
+                {
                     TypeContext typeContext = context.getTypeContext();
 
                     return this.subtypeResolver(declaredType, typeContext, allowedPluginTypes);
                 });
 
             // description as Markdown
-            builder.forTypesInGeneral().withTypeAttributeOverride((collectedTypeAttributes, scope, context) -> {
+            builder.forTypesInGeneral().withTypeAttributeOverride((collectedTypeAttributes, scope, context) ->
+            {
                 this.mutateDescription(collectedTypeAttributes);
             });
 
-            builder.forFields().withInstanceAttributeOverride((collectedTypeAttributes, scope, context) -> {
+            builder.forFields().withInstanceAttributeOverride((collectedTypeAttributes, scope, context) ->
+            {
                 this.mutateDescription(collectedTypeAttributes);
             });
 
             // default is no more required
-            builder.forTypesInGeneral().withTypeAttributeOverride((collectedTypeAttributes, scope, context) -> {
+            builder.forTypesInGeneral().withTypeAttributeOverride((collectedTypeAttributes, scope, context) ->
+            {
                 if (collectedTypeAttributes.has("required") && collectedTypeAttributes.get("required") instanceof ArrayNode) {
                     ArrayNode required = context.getGeneratorConfig().createArrayNode();
 
-                    collectedTypeAttributes.get("required").forEach(jsonNode -> {
-                        if (!collectedTypeAttributes.get("properties").get(jsonNode.asText()).has("default")
-                            && !defaultInAllOf(collectedTypeAttributes.get("properties").get(jsonNode.asText()))) {
+                    collectedTypeAttributes.get("required").forEach(jsonNode ->
+                    {
+                        if (
+                            !collectedTypeAttributes.get("properties").get(jsonNode.asText()).has("default")
+                                && !defaultInAllOf(collectedTypeAttributes.get("properties").get(jsonNode.asText()))
+                        ) {
                             required.add(jsonNode.asText());
                         }
                     });
@@ -535,19 +916,22 @@ public class JsonSchemaGenerator {
             });
 
             // invalid regexp for jsonschema
-            builder.forFields().withInstanceAttributeOverride((collectedTypeAttributes, scope, context) -> {
+            builder.forFields().withInstanceAttributeOverride((collectedTypeAttributes, scope, context) ->
+            {
                 if (collectedTypeAttributes.has("pattern") && collectedTypeAttributes.get("pattern").asText().contains("javaJavaIdentifier")) {
                     collectedTypeAttributes.remove("pattern");
                 }
             });
 
             // examples in description
-            builder.forTypesInGeneral().withTypeAttributeOverride((collectedTypeAttributes, scope, context) -> {
+            builder.forTypesInGeneral().withTypeAttributeOverride((collectedTypeAttributes, scope, context) ->
+            {
                 if (collectedTypeAttributes.has("$examples")) {
                     ArrayNode examples = (ArrayNode) collectedTypeAttributes.get("$examples");
 
                     String doc = StreamSupport.stream(examples.spliterator(), true)
-                        .map(jsonNode -> {
+                        .map(jsonNode ->
+                        {
                             String description = "";
                             if (jsonNode.has("title")) {
                                 description += "> " + jsonNode.get("title").asText() + "\n";
@@ -563,9 +947,7 @@ public class JsonSchemaGenerator {
                         })
                         .collect(Collectors.joining("\n\n"));
 
-                    String description = collectedTypeAttributes.has("markdownDescription") ?
-                        collectedTypeAttributes.get("markdownDescription").asText() :
-                        "";
+                    String description = collectedTypeAttributes.has("markdownDescription") ? collectedTypeAttributes.get("markdownDescription").asText() : "";
 
                     description += "##### Examples\n" + doc;
 
@@ -576,7 +958,8 @@ public class JsonSchemaGenerator {
             });
         } else {
             builder.forTypesInGeneral()
-                .withSubtypeResolver((declaredType, context) -> {
+                .withSubtypeResolver((declaredType, context) ->
+                {
                     TypeContext typeContext = context.getTypeContext();
 
                     if (SUBTYPE_RESOLUTION_EXCLUSION_FOR_PLUGIN_SCHEMA.contains(declaredType.getErasedType())) {
@@ -589,12 +972,23 @@ public class JsonSchemaGenerator {
 
         // Ensure that `type` is defined as a constant in JSON Schema.
         // The `const` property is used by editors for auto-completion based on that schema.
-        builder.forTypesInGeneral().withTypeAttributeOverride((collectedTypeAttributes, scope, context) -> {
+        builder.forTypesInGeneral().withTypeAttributeOverride((collectedTypeAttributes, scope, context) ->
+        {
             final Class<?> pluginType = scope.getType().getErasedType();
             Plugin pluginAnnotation = pluginType.getAnnotation(Plugin.class);
             if (pluginAnnotation != null) {
                 ObjectNode properties = (ObjectNode) collectedTypeAttributes.get("properties");
                 if (properties != null) {
+                    if (pluginType == Custom.class) {
+                        // The free-form branch of the output assets: where every other plugin pins its type to a
+                        // constant, a custom asset keeps any type that no asset plugin provides.
+                        ObjectNode typeNode = properties.get("type") instanceof ObjectNode existing ? existing : properties.putObject("type");
+                        typeNode.put("type", "string");
+                        typeNode.put("title", "Custom asset type");
+                        typeNode.put("markdownDescription", "Any type that no asset plugin provides: the asset is stored with this type as is.");
+                        return;
+                    }
+
                     LinkedHashSet<String> allowedTypeValues = new LinkedHashSet<>();
                     allowedTypeValues.add(pluginType.getName());
 
@@ -624,8 +1018,9 @@ public class JsonSchemaGenerator {
                     }
 
                     if (allowedTypeValues.size() == 1) {
-                        properties.set("type", context.getGeneratorConfig().createObjectNode()
-                            .put("const", allowedTypeValues.iterator().next())
+                        properties.set(
+                            "type", context.getGeneratorConfig().createObjectNode()
+                                .put("const", allowedTypeValues.iterator().next())
                         );
                     } else {
                         ArrayNode enumNode = context.getGeneratorConfig().createArrayNode();
@@ -643,10 +1038,12 @@ public class JsonSchemaGenerator {
     }
 
     /**
-     * Properties which are defining an implementation to choose among multiple ones (JsonTypeInfo.property) are simple String with default. We move them to be a "const": "defaultValue" instead
+     * Properties which are defining an implementation to choose among multiple ones (JsonTypeInfo.property) are simple String with default. We move them to be a "const": "defaultValue"
+     * instead
      */
     private void typeDefiningPropertiesToConst(SchemaGeneratorConfigBuilder builder) {
-        builder.forTypesInGeneral().withTypeAttributeOverride((collectedTypeAttributes, scope, context) -> {
+        builder.forTypesInGeneral().withTypeAttributeOverride((collectedTypeAttributes, scope, context) ->
+        {
             final Class<?> targetType = scope.getType().getErasedType();
             JsonTypeInfo jsonTypeInfo = Optional.ofNullable(targetType.getSuperclass()).map(c -> c.getAnnotation(JsonTypeInfo.class)).orElse(null);
             if (jsonTypeInfo == null) {
@@ -664,19 +1061,21 @@ public class JsonSchemaGenerator {
             }
 
             String defaultValue = Optional.ofNullable(properties.get(property))
-                .flatMap(p -> {
+                .flatMap(p ->
+                {
                     Optional<String> defaultOpt = p.optional("default").map(JsonNode::asText);
                     if (defaultOpt.isPresent()) {
                         return defaultOpt;
                     }
 
-                    return p.optional("allOf").flatMap(node -> {
+                    return p.optional("allOf").flatMap(node ->
+                    {
                         if (node.isArray()) {
                             Iterable<JsonNode> iterable = node::values;
                             return StreamSupport.stream(
-                                    iterable.spliterator(),
-                                    false
-                                ).filter(subNode -> subNode.has("default"))
+                                iterable.spliterator(),
+                                false
+                            ).filter(subNode -> subNode.has("default"))
                                 .findFirst()
                                 .map(subNode -> subNode.get("default").asText());
                         }
@@ -689,8 +1088,9 @@ public class JsonSchemaGenerator {
                 return;
             }
 
-            properties.set(property, context.getGeneratorConfig().createObjectNode()
-                .put("const", defaultValue)
+            properties.set(
+                property, context.getGeneratorConfig().createObjectNode()
+                    .put("const", defaultValue)
             );
         });
     }
@@ -712,23 +1112,6 @@ public class JsonSchemaGenerator {
                 .filter(Predicate.not(io.kestra.core.models.Plugin::isInternal))
                 .flatMap(clz -> safelyResolveSubtype(declaredType, clz, typeContext).stream())
                 .toList();
-        } else if (declaredType.getErasedType() == Condition.class) {
-            return getRegisteredPlugins()
-                .stream()
-                .flatMap(registeredPlugin -> registeredPlugin.getConditions().stream())
-                .filter(p -> allowedPluginTypes.isEmpty() || allowedPluginTypes.contains(p.getName()))
-                .filter(Predicate.not(io.kestra.core.models.Plugin::isInternal))
-                .flatMap(clz -> safelyResolveSubtype(declaredType, clz, typeContext).stream())
-                .toList();
-        } else if (declaredType.getErasedType() == ScheduleCondition.class) {
-            return getRegisteredPlugins()
-                .stream()
-                .flatMap(registeredPlugin -> registeredPlugin.getConditions().stream())
-                .filter(ScheduleCondition.class::isAssignableFrom)
-                .filter(p -> allowedPluginTypes.isEmpty() || allowedPluginTypes.contains(p.getName()))
-                .filter(Predicate.not(io.kestra.core.models.Plugin::isInternal))
-                .flatMap(clz -> safelyResolveSubtype(declaredType, clz, typeContext).stream())
-                .toList();
         } else if (declaredType.getErasedType() == TaskRunner.class) {
             return getRegisteredPlugins()
                 .stream()
@@ -745,7 +1128,7 @@ public class JsonSchemaGenerator {
                 .filter(Predicate.not(io.kestra.core.models.Plugin::isInternal))
                 .map(typeContext::resolve)
                 .toList();
-        } else if (AdditionalPlugin.class.isAssignableFrom(declaredType.getErasedType())) { // base type for addition plugin is not AdditionalPlugin but a subtype of AdditionalPlugin.
+        } else if (AdditionalPlugin.class.isAssignableFrom(declaredType.getErasedType())) { // base type for additional plugin is not AdditionalPlugin but a subtype of AdditionalPlugin.
             return getRegisteredPlugins()
                 .stream()
                 .flatMap(registeredPlugin -> registeredPlugin.getAdditionalPlugins().stream())
@@ -756,13 +1139,22 @@ public class JsonSchemaGenerator {
                 .filter(Predicate.not(io.kestra.core.models.Plugin::isInternal))
                 .map(typeContext::resolve)
                 .toList();
+        } else if (declaredType.getErasedType() == FileRenderer.class) {
+            return getRegisteredPlugins()
+                .stream()
+                .flatMap(registeredPlugin -> registeredPlugin.getFileRenderers().stream())
+                .filter(p -> allowedPluginTypes.isEmpty() || allowedPluginTypes.contains(p.getName()))
+                .filter(Predicate.not(io.kestra.core.models.Plugin::isInternal))
+                .map(typeContext::resolve)
+                .toList();
         } else if (declaredType.getErasedType() == Chart.class) {
             return getRegisteredPlugins()
                 .stream()
                 .flatMap(registeredPlugin -> registeredPlugin.getCharts().stream())
                 .filter(p -> allowedPluginTypes.isEmpty() || allowedPluginTypes.contains(p.getName()))
                 .filter(Predicate.not(io.kestra.core.models.Plugin::isInternal))
-                .<ResolvedType>mapMulti((clz, consumer) -> {
+                .<ResolvedType> mapMulti((clz, consumer) ->
+                {
                     if (DataChart.class.isAssignableFrom(clz)) {
                         List<Class<? extends DataFilter<?, ?>>> dataFilters = getRegisteredPlugins()
                             .stream()
@@ -771,9 +1163,11 @@ public class JsonSchemaGenerator {
                             .toList();
 
                         TypeVariable<? extends Class<? extends Chart<?>>> dataFilterType = clz.getTypeParameters()[1];
-                        ParameterizedType chartAwareColumnDescriptor = ((ParameterizedType) ((WildcardType) ((ParameterizedType) dataFilterType.getBounds()[0]).getActualTypeArguments()[1]).getUpperBounds()[0]);
+                        ParameterizedType chartAwareColumnDescriptor = ((ParameterizedType) ((WildcardType) ((ParameterizedType) dataFilterType.getBounds()[0]).getActualTypeArguments()[1])
+                            .getUpperBounds()[0]);
 
-                        dataFilters.forEach(dataFilter -> {
+                        dataFilters.forEach(dataFilter ->
+                        {
                             Type fieldsEnum = ((ParameterizedType) dataFilter.getGenericSuperclass()).getActualTypeArguments()[0];
                             consumer.accept(typeContext.resolve(clz, fieldsEnum, typeContext.resolve(dataFilter, typeContext.resolve(chartAwareColumnDescriptor, fieldsEnum))));
                         });
@@ -785,9 +1179,11 @@ public class JsonSchemaGenerator {
                             .toList();
 
                         TypeVariable<? extends Class<? extends Chart<?>>> dataFilterType = clz.getTypeParameters()[1];
-                        ParameterizedType chartAwareColumnDescriptor = ((ParameterizedType) ((WildcardType) ((ParameterizedType) dataFilterType.getBounds()[0]).getActualTypeArguments()[1]).getUpperBounds()[0]);
+                        ParameterizedType chartAwareColumnDescriptor = ((ParameterizedType) ((WildcardType) ((ParameterizedType) dataFilterType.getBounds()[0]).getActualTypeArguments()[1])
+                            .getUpperBounds()[0]);
 
-                        dataFilterKPIs.forEach(dataFilterKPI -> {
+                        dataFilterKPIs.forEach(dataFilterKPI ->
+                        {
                             Type fieldsEnum = ((ParameterizedType) dataFilterKPI.getGenericSuperclass()).getActualTypeArguments()[0];
                             consumer.accept(typeContext.resolve(clz, fieldsEnum, typeContext.resolve(dataFilterKPI, typeContext.resolve(chartAwareColumnDescriptor, fieldsEnum))));
                         });
@@ -796,11 +1192,14 @@ public class JsonSchemaGenerator {
                     }
                 }).toList();
         } else if (declaredType.getErasedType() == Asset.class) {
-            return getRegisteredPlugins()
+            // Custom is what the asset deserializer falls back to for a type no asset plugin provides. It is hidden
+            // from the plugin registry, so it is added by hand as the free-form branch that lets such a type validate.
+            Stream<Class<? extends Asset>> registeredAssets = getRegisteredPlugins()
                 .stream()
                 .flatMap(registeredPlugin -> registeredPlugin.getAssets().stream())
                 .filter(p -> allowedPluginTypes.isEmpty() || allowedPluginTypes.contains(p.getName()))
-                .filter(Predicate.not(io.kestra.core.models.Plugin::isInternal))
+                .filter(Predicate.not(io.kestra.core.models.Plugin::isInternal));
+            return Stream.concat(registeredAssets, Stream.of(Custom.class))
                 .map(typeContext::resolve)
                 .toList();
         } else if (declaredType.getErasedType() == AssetExporter.class) {
@@ -811,9 +1210,30 @@ public class JsonSchemaGenerator {
                 .filter(Predicate.not(io.kestra.core.models.Plugin::isInternal))
                 .map(typeContext::resolve)
                 .toList();
+        } else if (declaredType.getErasedType() == io.kestra.core.models.flows.Input.class) {
+            // Resolve the input subtypes from the @JsonSubTypes registry, filtering out edition-restricted ones
+            // (e.g. REUSABLE_INPUTS) so they don't appear in the open-source flow schema. EE includes them all.
+            com.fasterxml.jackson.annotation.JsonSubTypes subTypes = io.kestra.core.models.flows.Input.class.getAnnotation(com.fasterxml.jackson.annotation.JsonSubTypes.class);
+            if (subTypes == null) {
+                return null;
+            }
+            return java.util.Arrays.stream(subTypes.value())
+                .map(com.fasterxml.jackson.annotation.JsonSubTypes.Type::value)
+                .filter(this::includeInputSubtype)
+                .flatMap(clz -> safelyResolveSubtype(declaredType, clz, typeContext).stream())
+                .collect(Collectors.toList());
         }
 
         return null;
+    }
+
+    /**
+     * Whether the given {@link io.kestra.core.models.flows.Input} subtype should appear in the generated flow
+     * schema. The open-source generator hides {@link io.kestra.core.models.flows.input.EeOnly}-annotated inputs;
+     * the EE generator overrides this to include them.
+     */
+    protected boolean includeInputSubtype(Class<?> subtype) {
+        return !subtype.isAnnotationPresent(io.kestra.core.models.flows.input.EeOnly.class);
     }
 
     protected static Optional<ResolvedType> safelyResolveSubtype(ResolvedType declaredType, Class<?> clz, TypeContext typeContext) {
@@ -832,7 +1252,7 @@ public class JsonSchemaGenerator {
 
     private boolean defaultInAllOf(JsonNode property) {
         if (property.has("allOf")) {
-            for (Iterator<JsonNode> it = property.get("allOf").elements(); it.hasNext(); ) {
+            for (Iterator<JsonNode> it = property.get("allOf").elements(); it.hasNext();) {
                 JsonNode child = it.next();
                 if (child.has("default")) {
                     return true;
@@ -857,9 +1277,10 @@ public class JsonSchemaGenerator {
         // we don't return base properties unless specified with @PluginProperty and hidden is false
         builder
             .forFields()
-            .withIgnoreCheck(fieldScope -> (base != null &&
-                (fieldScope.getAnnotation(PluginProperty.class) == null || fieldScope.getAnnotation(PluginProperty.class).hidden()) &&
-                fieldScope.getDeclaringType().getTypeName().equals(base.getName())) || fieldScope.getAnnotation(Hidden.class) != null
+            .withIgnoreCheck(
+                fieldScope -> (base != null &&
+                    (fieldScope.getAnnotation(PluginProperty.class) == null || fieldScope.getAnnotation(PluginProperty.class).hidden()) &&
+                    fieldScope.getDeclaringType().getTypeName().equals(base.getName())) || fieldScope.getAnnotation(Hidden.class) != null
             );
 
         SchemaGeneratorConfig schemaGeneratorConfig = builder.build();
@@ -897,11 +1318,7 @@ public class JsonSchemaGenerator {
             }
         }
 
-        if (!defaultInstances.containsKey(baseCls)) {
-            defaultInstances.put(baseCls, buildDefaultInstance(baseCls));
-        }
-
-        Object instance = defaultInstances.get(baseCls);
+        Object instance = defaultInstances.computeIfAbsent(baseCls, clazz -> buildDefaultInstance(clazz));
 
         return instance == null ? null : defaultValue(instance, baseCls, target.getName());
     }
@@ -982,8 +1399,7 @@ public class JsonSchemaGenerator {
 
             field.setAccessible(true);
             return field.invoke(instance);
-        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException |
-                 IllegalArgumentException ignored) {
+        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException | IllegalArgumentException ignored) {
 
         }
 
@@ -992,8 +1408,7 @@ public class JsonSchemaGenerator {
 
             field.setAccessible(true);
             return field.invoke(instance);
-        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException |
-                 IllegalArgumentException ignored) {
+        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException | IllegalArgumentException ignored) {
 
         }
 

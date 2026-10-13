@@ -1,43 +1,60 @@
 package io.kestra.plugin.scripts.runner.docker;
 
-import com.github.dockerjava.api.model.Container;
-import io.kestra.core.models.executions.LogEntry;
-import io.kestra.core.models.property.Property;
-import io.kestra.core.models.tasks.runners.AbstractTaskRunnerTest;
-import io.kestra.core.models.tasks.runners.ScriptService;
-import io.kestra.core.models.tasks.runners.TaskRunner;
-import io.kestra.core.queues.QueueFactoryInterface;
-import io.kestra.core.queues.QueueInterface;
-import io.kestra.core.runners.RunContext;
-import io.kestra.core.utils.Await;
-import io.kestra.core.utils.IdUtils;
-import io.kestra.core.utils.TestsUtils;
-import io.kestra.plugin.scripts.exec.scripts.runners.CommandsWrapper;
-import jakarta.inject.Inject;
-import jakarta.inject.Named;
-import org.assertj.core.api.Assertions;
-import org.hamcrest.MatcherAssert;
-import org.junit.jupiter.api.Test;
-import reactor.core.publisher.Flux;
 import java.lang.reflect.Method;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import org.assertj.core.api.Assertions;
+import org.hamcrest.MatcherAssert;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
+
+import com.github.dockerjava.api.model.Container;
+
+import io.kestra.core.models.executions.LogEntry;
+import io.kestra.core.models.property.Property;
+import io.kestra.core.models.tasks.runners.AbstractTaskRunnerTest;
+import io.kestra.core.models.tasks.runners.ScriptService;
+import io.kestra.core.models.tasks.runners.TaskRunner;
+import io.kestra.core.queues.DispatchQueueInterface;
+import io.kestra.core.runners.RunContext;
+import io.kestra.core.utils.Await;
+import io.kestra.core.utils.IdUtils;
+import io.kestra.core.utils.TestsUtils;
+import io.kestra.plugin.scripts.exec.scripts.runners.CommandsWrapper;
+
+import jakarta.inject.Inject;
 
 import static io.kestra.core.utils.Rethrow.throwRunnable;
 import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.is;
 
-
-
 class DockerTest extends AbstractTaskRunnerTest {
     @Inject
-    @Named(QueueFactoryInterface.WORKERTASKLOG_NAMED)
-    QueueInterface<LogEntry> workerTaskLogQueue;
+    DispatchQueueInterface<LogEntry> workerTaskLogQueue;
+
+    @BeforeEach
+    void assumeDockerAvailable() {
+        String dockerHost = Optional.ofNullable(System.getenv("DOCKER_HOST"))
+            .filter(host -> !host.isBlank())
+            .orElse("unix:///var/run/docker.sock");
+
+        boolean dockerAvailable = !dockerHost.startsWith("unix://") ||
+            Files.exists(Path.of(dockerHost.substring("unix://".length())));
+
+        Assumptions.assumeTrue(
+            dockerAvailable,
+            "Skipping Docker tests: Docker host not available: " + dockerHost
+        );
+    }
 
     @Override
     protected TaskRunner<?> taskRunner() {
@@ -53,10 +70,14 @@ class DockerTest extends AbstractTaskRunnerTest {
             .pullPolicy(Property.ofValue(PullPolicy.ALWAYS))
             .build();
 
-        var taskCommands = new CommandsWrapper(runContext).withCommands(Property.ofValue(List.of(
-            "/bin/sh", "-c",
-            "echo Hello World!"
-        )));
+        var taskCommands = new CommandsWrapper(runContext).withCommands(
+            Property.ofValue(
+                List.of(
+                    "/bin/sh", "-c",
+                    "echo Hello World!"
+                )
+            )
+        );
         var result = docker.run(runContext, taskCommands, Collections.emptyList());
 
         assertThat(result).isNotNull();
@@ -77,11 +98,15 @@ class DockerTest extends AbstractTaskRunnerTest {
             .cpu(cpuConfig)
             .build();
 
-        var taskCommands = new CommandsWrapper(runContext).withCommands(Property.ofValue(List.of(
-                "/bin/sh", "-c",
-                "CPU_LIMIT=$(cat /sys/fs/cgroup/cpu.max || cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us) && " +
-                    "echo \"::{\\\"outputs\\\":{\\\"cpuLimit\\\":\\\"$CPU_LIMIT\\\"}}::\""
-            )));
+        var taskCommands = new CommandsWrapper(runContext).withCommands(
+            Property.ofValue(
+                List.of(
+                    "/bin/sh", "-c",
+                    "CPU_LIMIT=$(cat /sys/fs/cgroup/cpu.max || cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us) && " +
+                        "echo \"::{\\\"outputs\\\":{\\\"cpuLimit\\\":\\\"$CPU_LIMIT\\\"}}::\""
+                )
+            )
+        );
         var result = docker.run(runContext, taskCommands, Collections.emptyList());
 
         assertThat(result).isNotNull();
@@ -104,17 +129,14 @@ class DockerTest extends AbstractTaskRunnerTest {
         var runContext = runContext(this.runContextFactory, null, taskRunId);
         var commands = initScriptCommands(runContext);
 
-
         // Setup log queue consumer
         List<LogEntry> logs = new CopyOnWriteArrayList<>();
-        Flux<LogEntry> receive = TestsUtils.receive(workerTaskLogQueue, (logEntry) -> {
-            if (logEntry.isLeft()) {
-                logs.add(logEntry.getLeft());
-            }
-        });
+        workerTaskLogQueue.addListener(logs::add);
 
-        var commandsList = ScriptService.scriptCommands(List.of("/bin/sh", "-c"), Collections.emptyList(),
-            List.of("echo 'sleeping for 50 seconds' && sleep 50"));
+        var commandsList = ScriptService.scriptCommands(
+            List.of("/bin/sh", "-c"), Collections.emptyList(),
+            List.of("echo 'sleeping for 50 seconds' && sleep 50")
+        );
         Mockito.when(commands.getCommands()).thenReturn(Property.ofValue(commandsList));
 
         var taskRunner = ((Docker) taskRunner())
@@ -133,7 +155,8 @@ class DockerTest extends AbstractTaskRunnerTest {
 
             var timeout = Duration.ofSeconds(30);
             // Wait for the container to be created
-            Await.until(() -> {
+            Await.until(() ->
+            {
                 List<Container> existingContainers = client.listContainersCmd()
                     .withShowAll(true)
                     .withLabelFilter(labels)
@@ -141,7 +164,8 @@ class DockerTest extends AbstractTaskRunnerTest {
                 return !existingContainers.isEmpty() && existingContainers.get(0).getState().equals("running");
             }, Duration.ofMillis(100), timeout); // Add timeout to avoid waiting forever for container to be created
 
-            callOnKill(taskRunner, () -> {
+            callOnKill(taskRunner, () ->
+            {
                 // override the kill method to not kill the container
             });
             initialContainerThread.interrupt();
@@ -168,7 +192,6 @@ class DockerTest extends AbstractTaskRunnerTest {
             LogEntry createContainerLog = TestsUtils
                 .awaitLog(logs, logEntry -> logEntry.getMessage().contains("Container created:"));
 
-            receive.blockLast(timeout);
             // Assert that the log messages are present
             assertThat(createContainerLog).withFailMessage("create container log should not be null").isNotNull();
             assertThat(createContainerLog.getMessage()).contains("Container created:");
@@ -179,8 +202,7 @@ class DockerTest extends AbstractTaskRunnerTest {
 
             String createContainerId = null;
             String resumeContainerId = null;
-            Matcher createContainerMatcher =
-                Pattern.compile("Container created: ([\\w]+)").matcher(createContainerLog.getMessage());
+            Matcher createContainerMatcher = Pattern.compile("Container created: ([\\w]+)").matcher(createContainerLog.getMessage());
             if (createContainerMatcher.find()) {
                 createContainerId = createContainerMatcher.group(1);
             }
@@ -188,8 +210,7 @@ class DockerTest extends AbstractTaskRunnerTest {
             assertThat(createContainerId)
                 .withFailMessage("Could not extract container id from create container log: %s", createContainerLog.getMessage())
                 .isNotNull();
-            Matcher resumeContainerMatcher =
-                Pattern.compile("Resuming existing container: ([\\w]+)").matcher(awaitLog.getMessage());
+            Matcher resumeContainerMatcher = Pattern.compile("Resuming existing container: ([\\w]+)").matcher(awaitLog.getMessage());
             if (resumeContainerMatcher.find()) {
                 resumeContainerId = resumeContainerMatcher.group(1);
             }
@@ -216,17 +237,14 @@ class DockerTest extends AbstractTaskRunnerTest {
         var runContext = runContext(this.runContextFactory, null, taskRunId);
         var commands = initScriptCommands(runContext);
 
-
         // Setup log queue consumer
         List<LogEntry> logs = new CopyOnWriteArrayList<>();
-        Flux<LogEntry> receive = TestsUtils.receive(workerTaskLogQueue, (logEntry) -> {
-            if (logEntry.isLeft()) {
-                logs.add(logEntry.getLeft());
-            }
-        });
+        workerTaskLogQueue.addListener(logEntry -> logs.add(logEntry));
 
-        var commandsList = ScriptService.scriptCommands(List.of("/bin/sh", "-c"), Collections.emptyList(),
-            List.of("echo 'sleeping for 50 seconds' && sleep 50"));
+        var commandsList = ScriptService.scriptCommands(
+            List.of("/bin/sh", "-c"), Collections.emptyList(),
+            List.of("echo 'sleeping for 50 seconds' && sleep 50")
+        );
         Mockito.when(commands.getCommands()).thenReturn(Property.ofValue(commandsList));
 
         var taskRunner = ((Docker) taskRunner())
@@ -245,7 +263,8 @@ class DockerTest extends AbstractTaskRunnerTest {
 
             var timeout = Duration.ofSeconds(30);
             // Wait for the container to be created
-            Await.until(() -> {
+            Await.until(() ->
+            {
                 List<Container> existingContainers = client.listContainersCmd()
                     .withShowAll(true)
                     .withLabelFilter(labels)
@@ -258,7 +277,8 @@ class DockerTest extends AbstractTaskRunnerTest {
                 logEntry -> logEntry.getMessage().contains("Container created:")
             );
 
-            callOnKill(taskRunner, () -> {
+            callOnKill(taskRunner, () ->
+            {
                 // override the kill method to not kill the container
             });
             initialContainerThread.interrupt();
@@ -285,7 +305,6 @@ class DockerTest extends AbstractTaskRunnerTest {
             LogEntry awaitLog = TestsUtils
                 .awaitLog(logs, logEntry -> logEntry.getMessage().contains("Resuming existing container:"));
 
-            receive.blockLast(timeout);
             // Assert that the log messages are present
             assertThat(createContainerLog).withFailMessage("create container log should not be null").isNotNull();
             assertThat(createContainerLog.getMessage()).contains("Container created:");
@@ -296,8 +315,7 @@ class DockerTest extends AbstractTaskRunnerTest {
 
             String createContainerId = null;
             String resumeContainerId = null;
-            Matcher createContainerMatcher =
-                Pattern.compile("Container created: ([\\w]+)").matcher(createContainerLog.getMessage());
+            Matcher createContainerMatcher = Pattern.compile("Container created: ([\\w]+)").matcher(createContainerLog.getMessage());
             if (createContainerMatcher.find()) {
                 createContainerId = createContainerMatcher.group(1);
             }
@@ -305,8 +323,7 @@ class DockerTest extends AbstractTaskRunnerTest {
             assertThat(createContainerId)
                 .withFailMessage("Could not extract container id from create container log: %s", createContainerLog.getMessage())
                 .isNotNull();
-            Matcher resumeContainerMatcher =
-                Pattern.compile("Resuming existing container: ([\\w]+)").matcher(awaitLog.getMessage());
+            Matcher resumeContainerMatcher = Pattern.compile("Resuming existing container: ([\\w]+)").matcher(awaitLog.getMessage());
             if (resumeContainerMatcher.find()) {
                 resumeContainerId = resumeContainerMatcher.group(1);
             }

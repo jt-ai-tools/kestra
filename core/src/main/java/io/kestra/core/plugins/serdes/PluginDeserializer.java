@@ -1,21 +1,5 @@
 package io.kestra.core.plugins.serdes;
 
-import com.fasterxml.jackson.core.JsonParser;
-import com.fasterxml.jackson.databind.DeserializationContext;
-import com.fasterxml.jackson.databind.JsonDeserializer;
-import com.fasterxml.jackson.databind.JsonMappingException;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.type.TypeFactory;
-import io.kestra.core.contexts.KestraContext;
-import io.kestra.core.models.Plugin;
-import io.kestra.core.models.dashboards.charts.DataChart;
-import io.kestra.core.plugins.DefaultPluginRegistry;
-import io.kestra.core.plugins.PluginRegistry;
-import io.kestra.core.serializers.JacksonMapper;
-import io.micronaut.context.exceptions.NoSuchBeanException;
-import lombok.extern.slf4j.Slf4j;
-import org.slf4j.Logger;
-
 import java.io.IOException;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
@@ -23,11 +7,30 @@ import java.lang.reflect.TypeVariable;
 import java.lang.reflect.WildcardType;
 import java.util.Optional;
 
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JsonDeserializer;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.type.TypeFactory;
+
+import io.kestra.core.contexts.KestraContext;
+import io.kestra.core.models.Plugin;
+import io.kestra.core.models.dashboards.charts.DataChart;
+import io.kestra.core.plugins.DefaultPluginRegistry;
+import io.kestra.core.plugins.PluginRegistry;
+import io.kestra.core.serializers.JacksonMapper;
+
+import io.micronaut.context.exceptions.NoSuchBeanException;
+import lombok.extern.slf4j.Slf4j;
+
 /**
  * Specific {@link JsonDeserializer} for deserializing classes that implements the {@link Plugin} interface.
  * <p>
  * The {@link PluginDeserializer} uses the {@link PluginRegistry} to found the plugin class corresponding to
  * a plugin type.
+ * <p>
+ * Jackson 3 counterpart: {@link Jackson3PluginDeserializer}.
  */
 @Slf4j
 public class PluginDeserializer<T extends Plugin> extends JsonDeserializer<T> {
@@ -72,8 +75,10 @@ public class PluginDeserializer<T extends Plugin> extends JsonDeserializer<T> {
                 // By default, if no plugin-registry is configured retrieve
                 // the one configured from the static Kestra's context.
                 pluginRegistry = KestraContext.getContext().getPluginRegistry();
-            } catch (IllegalStateException | NoSuchBeanException ignore) {
+            } catch (IllegalStateException | NoSuchBeanException | NullPointerException ignore) {
                 // This error can only happen if the KestraContext is not initialized (i.e. in unit tests).
+                // NullPointerException included because a KestraContext.Initializer left behind by a closed
+                // context has a null application context, so getPluginRegistry() throws that instead.
                 log.error("No plugin registry was initialized. Use default implementation.");
                 pluginRegistry = DefaultPluginRegistry.getOrCreate();
             }
@@ -82,13 +87,16 @@ public class PluginDeserializer<T extends Plugin> extends JsonDeserializer<T> {
 
     @SuppressWarnings("unchecked")
     private T fromObjectNode(JsonParser jp,
-                             JsonNode node,
-                             DeserializationContext context) throws IOException {
-        Class<? extends Plugin> pluginType = null;
+        JsonNode node,
+        DeserializationContext context) throws IOException {
+        Class<? extends Plugin> pluginType;
 
         final String identifier = extractPluginRawIdentifier(node, pluginRegistry.isVersioningSupported());
-        if (identifier != null) {
-            log.trace("Looking for Plugin for: {}",
+        if (identifier == null) {
+            pluginType = defaultClass();
+        } else {
+            log.trace(
+                "Looking for Plugin for: {}",
                 identifier
             );
             pluginType = pluginRegistry.findClassByIdentifier(identifier);
@@ -102,7 +110,8 @@ public class PluginDeserializer<T extends Plugin> extends JsonDeserializer<T> {
             String type = Optional.ofNullable(identifier).orElse("<null>");
             throwInvalidTypeException(context, type);
         } else if (Plugin.class.isAssignableFrom(pluginType)) {
-            log.trace("Read plugin for: {}",
+            log.trace(
+                "Read plugin for: {}",
                 pluginType.getName()
             );
 
@@ -110,21 +119,25 @@ public class PluginDeserializer<T extends Plugin> extends JsonDeserializer<T> {
                 final Class<? extends Plugin> dataFilterClass = pluginRegistry.findClassByIdentifier(extractPluginRawIdentifier(node.get("data"), pluginRegistry.isVersioningSupported()));
                 ParameterizedType genericDataFilterClass = (ParameterizedType) dataFilterClass.getGenericSuperclass();
                 Type dataFieldsEnum = genericDataFilterClass.getActualTypeArguments()[0];
-                TypeFactory typeFactory = JacksonMapper.ofJson().getTypeFactory();
+                TypeFactory typeFactory = JacksonMapper.ofJson(true).getTypeFactory();
                 Type chartAwareColumnDescriptorClass = ((ParameterizedType) ((WildcardType) ((ParameterizedType) ((TypeVariable<?>)
-                    // DataChart generic class
-                    ((ParameterizedType) pluginType.getGenericSuperclass())
-                        // DataFilter generic class
-                        .getActualTypeArguments()[1]).getBounds()[0]
-                    // ColumnDescriptor implementation class
+                // DataChart generic class
+                ((ParameterizedType) pluginType.getGenericSuperclass())
+                    // DataFilter generic class
+                    .getActualTypeArguments()[1]).getBounds()[0]
+                // ColumnDescriptor implementation class
                 ).getActualTypeArguments()[1]).getUpperBounds()[0]).getRawType();
 
-                return JacksonMapper.ofJson().convertValue(node, typeFactory.constructParametricType(
-                    pluginType,
-                    typeFactory.constructType(dataFieldsEnum),
-                    typeFactory.constructParametricType(dataFilterClass,
-                        typeFactory.constructParametricType((Class<?>) chartAwareColumnDescriptorClass, (Class<?>) dataFieldsEnum)
-                    )));
+                return JacksonMapper.ofJson(true).convertValue(
+                    node, typeFactory.constructParametricType(
+                        pluginType,
+                        typeFactory.constructType(dataFieldsEnum),
+                        typeFactory.constructParametricType(
+                            dataFilterClass,
+                            typeFactory.constructParametricType((Class<?>) chartAwareColumnDescriptorClass, (Class<?>) dataFieldsEnum)
+                        )
+                    )
+                );
             }
 
             // Note that if the provided plugin is not annotated with `@JsonDeserialize()` then
@@ -138,7 +151,7 @@ public class PluginDeserializer<T extends Plugin> extends JsonDeserializer<T> {
     }
 
     private static void throwInvalidTypeException(final DeserializationContext context,
-                                                  final String type) throws JsonMappingException {
+        final String type) throws JsonMappingException {
         throw context.invalidTypeIdException(
             context.constructType(Plugin.class),
             type,
@@ -150,6 +163,18 @@ public class PluginDeserializer<T extends Plugin> extends JsonDeserializer<T> {
         String type = Optional.ofNullable(node.get(TYPE)).map(JsonNode::textValue).orElse(null);
         String version = Optional.ofNullable(node.get(VERSION)).map(JsonNode::asText).orElse(null);
 
+        return rawIdentifier(type, version, isVersioningSupported);
+    }
+
+    /**
+     * Builds the plugin registry identifier from an already-extracted type and version.
+     *
+     * @param type                 The plugin type, may be {@code null} or empty.
+     * @param version              The plugin version, may be {@code null} or empty.
+     * @param isVersioningSupported Whether the registry resolves versioned identifiers.
+     * @return The raw identifier, or {@code null} if no type was provided.
+     */
+    static String rawIdentifier(final String type, final String version, final boolean isVersioningSupported) {
         if (type == null || type.isEmpty()) {
             return null;
         }
@@ -158,6 +183,13 @@ public class PluginDeserializer<T extends Plugin> extends JsonDeserializer<T> {
     }
 
     protected Class<? extends Plugin> fallbackClass() {
+        return null;
+    }
+
+    /**
+     * The class to deserialize to when no type is declared, {@code null} making a missing type an error.
+     */
+    protected Class<? extends Plugin> defaultClass() {
         return null;
     }
 }

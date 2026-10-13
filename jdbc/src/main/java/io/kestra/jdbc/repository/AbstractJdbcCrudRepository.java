@@ -1,19 +1,22 @@
 package io.kestra.jdbc.repository;
 
-import io.kestra.core.models.HasUID;
-import io.kestra.core.repositories.ArrayListTotal;
-import io.kestra.core.utils.ListUtils;
-import io.micronaut.data.model.Pageable;
-import org.jooq.*;
-import org.jooq.Record;
-import org.jooq.impl.DSL;
-import reactor.core.publisher.Flux;
-import reactor.core.publisher.FluxSink;
-
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.stream.Stream;
+
+import org.jooq.*;
+import org.jooq.Record;
+import org.jooq.impl.DSL;
+
+import io.kestra.core.models.HasUID;
+import io.kestra.core.models.QueryFilter;
+import io.kestra.core.models.SoftDeletable;
+import io.kestra.core.repositories.ArrayListTotal;
+import io.kestra.core.utils.ListUtils;
+
+import io.micronaut.data.model.Pageable;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
 
 /**
  * Base JDBC repository for CRUD operations.
@@ -22,17 +25,20 @@ import java.util.stream.Stream;
  * If the child repository uses a default filter, it should override it.
  * <p>
  * For example, to avoid supporting allowDeleted:
- * <pre>{@code
- * @Override
+ *
+ * <pre>
+ * {@code
+ * &#64;Override
  * protected Condition defaultFilter(String tenantId) {
  *     return buildTenantCondition(tenantId);
  * }
  *
  * @Override
  * protected Condition defaultFilter() {
- *     return DSL.trueCondition();
+ *     return DSL.noCondition();
  * }
- * }</pre>
+ * }
+ * </pre>
  *
  * @param <T> the type of the persisted entity.
  */
@@ -94,14 +100,15 @@ public abstract class AbstractJdbcCrudRepository<T> extends AbstractJdbcReposito
     public T update(T current) {
 
         if (!(current instanceof HasUID hasUID)) {
-            throw new IllegalArgumentException( "Cannot update entity: '" + current.getClass().getName() + "' doesn't implement HasUID");
+            throw new IllegalArgumentException("Cannot update entity: '" + current.getClass().getName() + "' doesn't implement HasUID");
         }
 
         String uid = hasUID.uid();
 
         return this.jdbcRepository
             .getDslContextWrapper()
-            .transactionResult(configuration -> {
+            .transactionResult(configuration ->
+            {
                 DSL.using(configuration)
                     .update(this.jdbcRepository.getTable())
                     .set(this.jdbcRepository.persistFields((current)))
@@ -110,6 +117,73 @@ public abstract class AbstractJdbcCrudRepository<T> extends AbstractJdbcReposito
 
                 return current;
             });
+    }
+
+    @SuppressWarnings("unchecked")
+    public void deleteWithoutAcl(T item) {
+        T deleted = (T) ((SoftDeletable<?>) item).toDeleted();
+        this.jdbcRepository.persist(deleted);
+    }
+
+    /**
+     * Delete an item.
+     * If the entity implements {@link SoftDeletable}, it will be soft-deleted
+     * Otherwise, it will be hard-deleted
+     *
+     * @param item the item to delete.
+     * @return the deleted item.
+     */
+    @SuppressWarnings("unchecked")
+    public T delete(T item) {
+        if (item instanceof SoftDeletable<?> softDeletable) {
+            T deleted = (T) softDeletable.toDeleted();
+            this.jdbcRepository.persist(deleted);
+            return deleted;
+        }
+
+        this.jdbcRepository.delete(item);
+        return item;
+    }
+
+    /**
+     * Hard-delete an item from the database.
+     * Use this for physical purge operations on a single item.
+     *
+     * @param item the item to purge.
+     * @return {@code true} if the item was deleted, {@code false} if it was not found.
+     */
+    public boolean purge(T item) {
+        return this.jdbcRepository.delete(item) > 0;
+    }
+
+    /**
+     * Hard-delete all items matching the given condition for the given tenant.
+     *
+     * @param tenantId the tenant ID used to build the default filter.
+     * @param condition the condition to match items for deletion.
+     * @return the number of deleted rows.
+     */
+    protected Integer purge(String tenantId, Condition condition) {
+        return purge(defaultFilter(tenantId), condition);
+    }
+
+    /**
+     * Hard-delete all items matching the given conditions.
+     *
+     * @param defaultFilter the base filter condition (e.g. tenant isolation).
+     * @param condition the condition to match items for deletion.
+     * @return the number of deleted rows.
+     */
+    protected Integer purge(Condition defaultFilter, Condition condition) {
+        return this.jdbcRepository
+            .getDslContextWrapper()
+            .transactionResult(
+                configuration -> DSL.using(configuration)
+                    .delete(this.jdbcRepository.getTable())
+                    .where(defaultFilter)
+                    .and(condition)
+                    .execute()
+            );
     }
 
     /**
@@ -151,7 +225,8 @@ public abstract class AbstractJdbcCrudRepository<T> extends AbstractJdbcReposito
     protected final <F> Optional<T> findOne(Condition defaultFilter, Condition condition, OrderField<F>... orderByFields) {
         return this.jdbcRepository
             .getDslContextWrapper()
-            .transactionResult(configuration -> {
+            .transactionResult(configuration ->
+            {
                 var select = DSL
                     .using(configuration)
                     .select(VALUE_FIELD)
@@ -202,7 +277,8 @@ public abstract class AbstractJdbcCrudRepository<T> extends AbstractJdbcReposito
     protected final <F> List<T> find(Condition defaultFilter, Condition condition, OrderField<F>... orderByFields) {
         return this.jdbcRepository
             .getDslContextWrapper()
-            .transactionResult(configuration -> {
+            .transactionResult(configuration ->
+            {
                 var select = DSL
                     .using(configuration)
                     .select(VALUE_FIELD)
@@ -252,28 +328,32 @@ public abstract class AbstractJdbcCrudRepository<T> extends AbstractJdbcReposito
      */
     @SafeVarargs
     protected final <F> Flux<T> findAsync(Condition defaultFilter, Condition condition, OrderField<F>... orderByFields) {
-        return Flux.create(emitter -> this.jdbcRepository
-            .getDslContextWrapper()
-            .transaction(configuration -> {
-                DSLContext context = DSL.using(configuration);
+        return Flux.create(
+            emitter -> this.jdbcRepository
+                .getDslContextWrapper()
+                .transaction(configuration ->
+                {
+                    DSLContext context = DSL.using(configuration);
 
-                var select = context
-                    .select(VALUE_FIELD)
-                    .from(this.jdbcRepository.getTable())
-                    .where(defaultFilter)
-                    .and(condition);
+                    var select = context
+                        .select(VALUE_FIELD)
+                        .from(this.jdbcRepository.getTable())
+                        .where(defaultFilter)
+                        .and(condition);
 
-                if (orderByFields != null) {
-                    select.orderBy(orderByFields);
-                }
+                    if (orderByFields != null) {
+                        select.orderBy(orderByFields);
+                    }
 
-                try (var stream = select.fetchSize(FETCH_SIZE).stream()){
-                    stream.map((Record record) -> jdbcRepository.map(record))
-                        .forEach(emitter::next);
-                } finally {
-                    emitter.complete();
-                }
-            }), FluxSink.OverflowStrategy.BUFFER);
+                    try (var stream = select.fetchSize(FETCH_SIZE).stream()) {
+                        stream.map((Record record) -> jdbcRepository.map(record))
+                            .forEach(emitter::next);
+                    } finally {
+                        emitter.complete();
+                    }
+                }),
+            FluxSink.OverflowStrategy.BUFFER
+        );
     }
 
     /**
@@ -309,7 +389,8 @@ public abstract class AbstractJdbcCrudRepository<T> extends AbstractJdbcReposito
     protected final <F> ArrayListTotal<T> findPage(Pageable pageable, Condition defaultFilter, Condition condition, OrderField<F>... orderByFields) {
         return this.jdbcRepository
             .getDslContextWrapper()
-            .transactionResult(configuration -> {
+            .transactionResult(configuration ->
+            {
                 DSLContext context = DSL.using(configuration);
 
                 var select = context
@@ -343,7 +424,8 @@ public abstract class AbstractJdbcCrudRepository<T> extends AbstractJdbcReposito
     protected List<T> findAll(Condition defaultFilter) {
         return this.jdbcRepository
             .getDslContextWrapper()
-            .transactionResult(configuration -> {
+            .transactionResult(configuration ->
+            {
                 var select = DSL
                     .using(configuration)
                     .select(VALUE_FIELD)
@@ -371,23 +453,27 @@ public abstract class AbstractJdbcCrudRepository<T> extends AbstractJdbcReposito
      * @see #findAll(Condition)
      */
     protected Flux<T> findAllAsync(Condition defaultFilter) {
-        return Flux.create(emitter -> this.jdbcRepository
-            .getDslContextWrapper()
-            .transaction(configuration -> {
-                DSLContext context = DSL.using(configuration);
+        return Flux.create(
+            emitter -> this.jdbcRepository
+                .getDslContextWrapper()
+                .transaction(configuration ->
+                {
+                    DSLContext context = DSL.using(configuration);
 
-                var select = context
-                    .select(VALUE_FIELD)
-                    .from(this.jdbcRepository.getTable())
-                    .where(defaultFilter);
+                    var select = context
+                        .select(VALUE_FIELD)
+                        .from(this.jdbcRepository.getTable())
+                        .where(defaultFilter);
 
-                try (var stream = select.fetchSize(FETCH_SIZE).stream()){
-                    stream.map((Record record) -> jdbcRepository.map(record))
-                        .forEach(emitter::next);
-                } finally {
-                    emitter.complete();
-                }
-            }), FluxSink.OverflowStrategy.BUFFER);
+                    try (var stream = select.fetchSize(FETCH_SIZE).stream()) {
+                        stream.map((Record record) -> jdbcRepository.map(record))
+                            .forEach(emitter::next);
+                    } finally {
+                        emitter.complete();
+                    }
+                }),
+            FluxSink.OverflowStrategy.BUFFER
+        );
     }
 
     /**
@@ -397,7 +483,8 @@ public abstract class AbstractJdbcCrudRepository<T> extends AbstractJdbcReposito
     public List<T> findAllForAllTenants() {
         return this.jdbcRepository
             .getDslContextWrapper()
-            .transactionResult(configuration -> {
+            .transactionResult(configuration ->
+            {
                 var select = DSL
                     .using(configuration)
                     .select(VALUE_FIELD)
@@ -406,6 +493,41 @@ public abstract class AbstractJdbcCrudRepository<T> extends AbstractJdbcReposito
 
                 return this.jdbcRepository.fetch(select);
             });
+    }
+
+    /**
+     * Returns distinct values of {@code field}, optionally narrowed by {@code filters}.
+     * <p>
+     * Filters are routed through {@link #filter(List, String, QueryFilter.Resource)} which validates
+     * them against {@code resource} and combines each filter's condition via
+     * {@link #getConditionOnField}. Per-repository {@link #getColumnName} overrides (e.g.
+     * FLOW_ID → {@code id} on flows, → {@code detail_flow_id} on audit logs) are therefore
+     * honored. Pass {@code null} or an empty filter list to fetch the full distinct set under
+     * the tenant default filter.
+     * <p>
+     * Concrete repositories should expose this via a public override that supplies their resource.
+     */
+    protected List<String> findDistinctFieldValues(
+        String tenantId,
+        QueryFilter.Field field,
+        List<QueryFilter> filters,
+        Pageable pageable,
+        QueryFilter.Resource resource) {
+        Field<String> column = getColumn(field).coerce(String.class);
+        Condition where = defaultFilter(tenantId).and(filter(filters, null, resource));
+
+        return this.jdbcRepository
+            .getDslContextWrapper()
+            .transactionResult(
+                configuration -> DSL
+                    .using(configuration)
+                    .selectDistinct(column)
+                    .from(this.jdbcRepository.getTable())
+                    .where(where)
+                    .orderBy(column.asc())
+                    .limit(pageable.getSize())
+                    .fetch(column)
+            );
     }
 
     /**

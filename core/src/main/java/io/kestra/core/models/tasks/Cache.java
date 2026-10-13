@@ -1,20 +1,21 @@
 package io.kestra.core.models.tasks;
 
-import io.micronaut.core.annotation.Introspected;
+import java.time.Duration;
+
+import org.hibernate.validator.constraints.time.DurationMin;
+
 import jakarta.validation.constraints.NotNull;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 
-import java.time.Duration;
-
 @Getter
 @NoArgsConstructor
 @AllArgsConstructor
-@Introspected
 public class Cache {
     @NotNull
     private Boolean enabled;
 
+    @DurationMin(millis = 1, message = "must be a positive duration")
     private Duration ttl;
 }

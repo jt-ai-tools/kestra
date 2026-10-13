@@ -1,5 +1,22 @@
 package io.kestra.core.runners;
 
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.*;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import org.slf4j.LoggerFactory;
+
+import com.cronutils.utils.VisibleForTesting;
+import com.google.common.base.Splitter;
+import com.google.common.base.Throwables;
+
+import io.kestra.core.exceptions.IllegalVariableEvaluationException;
+import io.kestra.core.models.executions.LogEntry;
+import io.kestra.core.models.executions.TaskRun;
+
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.LoggerContext;
@@ -10,38 +27,24 @@ import ch.qos.logback.classic.spi.LoggingEvent;
 import ch.qos.logback.classic.spi.ThrowableProxy;
 import ch.qos.logback.classic.util.LogbackMDCAdapter;
 import ch.qos.logback.core.AppenderBase;
-import com.cronutils.utils.VisibleForTesting;
-import com.google.common.base.Splitter;
-import com.google.common.base.Throwables;
-import io.kestra.core.exceptions.IllegalVariableEvaluationException;
-import io.kestra.core.models.executions.LogEntry;
-import io.kestra.core.queues.QueueException;
-import io.kestra.core.queues.QueueInterface;
 import jakarta.annotation.Nullable;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.io.IOUtils;
-import org.slf4j.LoggerFactory;
-
-import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.time.Instant;
-import java.util.*;
-import java.util.function.Supplier;
-import java.util.stream.Collectors;
 
 public class RunContextLogger implements Supplier<org.slf4j.Logger> {
     private static final int MAX_MESSAGE_LENGTH = 1024 * 15;
     public static final String ORIGINAL_TIMESTAMP_KEY = "originalTimestamp";
+    public static final String PROGRESS_KEY = "progress";
 
     private final String loggerName;
     private volatile Logger logger; // must be volatile as it is built lazily via DCL
 
-    private QueueInterface<LogEntry> logQueue;
+    private LogEntryEmitter logEmitter;
     private LogEntry logEntry;
     private Level loglevel;
     private final List<String> useSecrets = new ArrayList<>();
     private final boolean logToFile;
+    private final Map<String, String> mdcLabels;
 
     @Getter
     private File logFile;
@@ -51,9 +54,14 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
     public RunContextLogger() {
         this.loggerName = "unit-test";
         this.logToFile = false;
+        this.mdcLabels = Map.of();
     }
 
-    public RunContextLogger(QueueInterface<LogEntry> logQueue, LogEntry logEntry, org.slf4j.event.Level loglevel, boolean logToFile) {
+    public RunContextLogger(LogEntryEmitter logEmitter, LogEntry logEntry, org.slf4j.event.Level loglevel, boolean logToFile) {
+        this(logEmitter, logEntry, loglevel, logToFile, Map.of());
+    }
+
+    public RunContextLogger(LogEntryEmitter logEmitter, LogEntry logEntry, org.slf4j.event.Level loglevel, boolean logToFile, Map<String, String> mdcLabels) {
         if (logEntry.getTaskId() != null) {
             this.loggerName = baseLoggerName(logEntry) + "." + logEntry.getTaskId();
         } else if (logEntry.getTriggerId() != null) {
@@ -62,10 +70,28 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
             this.loggerName = baseLoggerName(logEntry);
         }
 
-        this.logQueue = logQueue;
+        this.logEmitter = logEmitter;
         this.logEntry = logEntry;
         this.loglevel = loglevel == null ? Level.TRACE : Level.toLevel(loglevel.toString());
         this.logToFile = logToFile;
+        this.mdcLabels = mdcLabels == null ? Map.of() : mdcLabels;
+    }
+
+    /**
+     * Merges the configured execution labels with the {@link LogEntry} context for the MDC;
+     * {@link LogEntry} keys win over labels sharing the same name.
+     */
+    private Map<String, String> mdcContext() {
+        if (this.logEntry == null) {
+            return this.mdcLabels;
+        }
+        if (this.mdcLabels.isEmpty()) {
+            return this.logEntry.toMap();
+        }
+
+        Map<String, String> context = new HashMap<>(this.mdcLabels);
+        context.putAll(this.logEntry.toMap());
+        return context;
     }
 
     private String baseLoggerName(LogEntry logEntry) {
@@ -79,6 +105,13 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
             return new ArrayList<>();
         }
 
+        String progress = event.getKeyValuePairs() == null ? null
+            : event.getKeyValuePairs().stream()
+                .filter(kv -> kv.key.equals(PROGRESS_KEY))
+                .map(kv -> (String) kv.value)
+                .findFirst()
+                .orElse(null);
+
         if (message.length() > MAX_MESSAGE_LENGTH) {
             split = Splitter.fixedLength(MAX_MESSAGE_LENGTH).split(message);
         } else {
@@ -87,21 +120,23 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
 
         List<LogEntry> result = new ArrayList<>();
         for (String s : split) {
-            result.add(LogEntry.builder()
-                .namespace(logEntry.getNamespace())
-                .tenantId(logEntry.getTenantId())
-                .flowId(logEntry.getFlowId())
-                .taskId(logEntry.getTaskId())
-                .executionId(logEntry.getExecutionId())
-                .executionKind(logEntry.getExecutionKind())
-                .taskRunId(logEntry.getTaskRunId())
-                .attemptNumber(logEntry.getAttemptNumber())
-                .triggerId(logEntry.getTriggerId())
-                .level(level != null ? level : org.slf4j.event.Level.valueOf(event.getLevel().toString()))
-                .message(s)
-                .timestamp(event.getInstant())
-                .thread(event.getThreadName())
-                .build()
+            result.add(
+                LogEntry.builder()
+                    .namespace(logEntry.getNamespace())
+                    .tenantId(logEntry.getTenantId())
+                    .flowId(logEntry.getFlowId())
+                    .taskId(logEntry.getTaskId())
+                    .executionId(logEntry.getExecutionId())
+                    .executionKind(logEntry.getExecutionKind())
+                    .taskRunId(logEntry.getTaskRunId())
+                    .attemptNumber(logEntry.getAttemptNumber())
+                    .triggerId(logEntry.getTriggerId())
+                    .level(level != null ? level : org.slf4j.event.Level.valueOf(event.getLevel().toString()))
+                    .message(s)
+                    .timestamp(event.getInstant())
+                    .thread(event.getThreadName())
+                    .progress(progress)
+                    .build()
             );
         }
 
@@ -118,20 +153,22 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
         List<LogEntry> result = new ArrayList<>(logEntry(event, event.getFormattedMessage(), null, logEntry));
 
         if (Throwables.getCausalChain(throwable).size() > 1 && !(throwable instanceof IllegalVariableEvaluationException)) {
-            result.addAll(logEntry(
-                event,
-                Throwables
-                    .getCausalChain(throwable)
-                    .stream()
-                    .skip(1)
-                    .map(Throwable::getMessage)
-                    .collect(Collectors.joining("\n")),
-                null,
-                logEntry
-            ));
+            result.addAll(
+                logEntry(
+                    event,
+                    Throwables
+                        .getCausalChain(throwable)
+                        .stream()
+                        .skip(1)
+                        .map(Throwable::getMessage)
+                        .collect(Collectors.joining("\n")),
+                    null,
+                    logEntry
+                )
+            );
         }
 
-        result.addAll(logEntry(event, Throwables.getStackTraceAsString(throwable), org.slf4j.event.Level.TRACE, logEntry));
+        result.addAll(logEntry(event, Throwables.getStackTraceAsString(throwable), org.slf4j.event.Level.DEBUG, logEntry));
 
         return result;
     }
@@ -149,9 +186,25 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
 
     public void usedSecret(String secret) {
         if (secret != null && !secret.isEmpty()) {
-            this.useSecrets.add(secret);
-            this.useSecrets.add(Base64.getEncoder().encodeToString(secret.getBytes(StandardCharsets.UTF_8)));
+            this.addSecretToMask(secret);
+            this.addSecretToMask(Base64.getEncoder().encodeToString(secret.getBytes(StandardCharsets.UTF_8)));
         }
+    }
+
+    /**
+     * Inserts a secret keeping the list ordered by descending length, because masking is a plain sequence of
+     * replacements: were a secret masked before a longer one containing it, the remainder of the longer secret
+     * would survive in the log line (masking 'pass' before 'password' leaves '******word').
+     */
+    private void addSecretToMask(final String secret) {
+        if (this.useSecrets.contains(secret)) {
+            return;
+        }
+        int index = 0;
+        while (index < this.useSecrets.size() && this.useSecrets.get(index).length() >= secret.length()) {
+            index++;
+        }
+        this.useSecrets.add(index, secret);
     }
 
     public org.slf4j.Logger logger() {
@@ -166,6 +219,100 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
         return this.logger;
     }
 
+    /**
+     * Emit a log entry to the log queue and the follow log queue.
+     * This is the preferred way to send logs to the queue, sending them directly is not recommended.
+     *
+     * @see #emitLogs(List)
+     */
+    public void emitLog(LogEntry logEntry) {
+        this.logEmitter.emits(logEntry);
+    }
+
+    /**
+     * Emit a list of log entries to the log queue and the follow log queue.
+     * This is the preferred way to send logs to the queue, sending them directly is not recommended.
+     *
+     * @see #emitLog(LogEntry)
+     */
+    public void emitLogs(List<LogEntry> logEntries) {
+        this.logEmitter.emits(logEntries);
+    }
+
+    /**
+     * Emit the given log entry only when its level is enabled for this context's configured
+     * log level. Prefer this over {@link #emitLog(LogEntry)} for manually built entries:
+     * direct emission bypasses the regular logging pipeline, so the configured level filter
+     * (e.g. a task's {@code logLevel} property) must be applied explicitly.
+     *
+     * @see #emitLog(LogEntry)
+     */
+    public void emitLogIfEnabled(LogEntry logEntry) {
+        if (logEntry.getLevel() == null || isLogLevelEnabled(logEntry.getLevel())) {
+            this.emitLog(logEntry);
+        }
+    }
+
+    /**
+     * Returns true when the given level is enabled for this context's configured log level.
+     */
+    public boolean isLogLevelEnabled(org.slf4j.event.Level level) {
+        return this.loglevel == null || Level.toLevel(level.toString()).isGreaterOrEqual(this.loglevel);
+    }
+
+    /**
+     * Emit the log lines attached to a dynamically-generated taskrun through the regular logging
+     * pipeline, so the standard appender behaviour (secret masking, long-message splitting, level
+     * filtering, forwarding to the server log, file vs queue routing) applies natively — the only
+     * thing that changes is the taskrun the lines are attributed to.
+     * <p>
+     * When this context logs to a file ({@code logToFile}), its logs are file-only (no inline/queue
+     * display): the lines are routed through this context's own logger so they land in the same
+     * downloadable file. A flat file has no taskrun, so there is nothing to link there.
+     * <p>
+     * Otherwise the lines go through a child logger bound to a {@link LogEntry} whose execution,
+     * tenant, namespace and flow are taken from this context's bound entry — a caller cannot target
+     * another execution or tenant — with the dynamic taskrun's id and a fixed attempt 0 (these
+     * taskruns have a single attempt and the log view groups by the 0-based attempt). The level
+     * filter and the secrets known to this context are inherited so nothing else is lost.
+     */
+    public void emitDynamicTaskRunLogs(TaskRun dynamicTaskRun, List<DynamicTaskRunLog> logs) {
+        // A logToFile task logs to a file only (no inline display): route the lines through this
+        // context's own logger so they join the same downloadable file (a flat file has no taskrun
+        // to link to). Otherwise emit through a logger bound to the dynamic taskrun, so the lines
+        // are attributed to it while still passing through the regular appender pipeline.
+        org.slf4j.Logger logger = this.logToFile ? this.logger() : deriveLoggerFor(dynamicTaskRun).logger();
+
+        for (DynamicTaskRunLog log : logs) {
+            logger.atLevel(log.level()).log(log.message());
+        }
+    }
+
+    /**
+     * Derive a logger bound to a dynamically-generated taskrun: a child of this context that shares
+     * its log emitter, level filter and known secrets, but emits under the taskrun's id with a fixed
+     * attempt 0 (these taskruns have a single attempt and the log view groups by the 0-based
+     * attempt). Execution, tenant, namespace and flow are taken from this context, so a caller can
+     * only ever target this execution's taskrun — never forge a log for another execution or tenant.
+     */
+    private RunContextLogger deriveLoggerFor(TaskRun dynamicTaskRun) {
+        LogEntry boundLogEntry = LogEntry.builder()
+            .tenantId(this.logEntry.getTenantId())
+            .executionId(this.logEntry.getExecutionId())
+            .namespace(this.logEntry.getNamespace())
+            .flowId(this.logEntry.getFlowId())
+            .executionKind(this.logEntry.getExecutionKind())
+            .taskId(dynamicTaskRun.getTaskId())
+            .taskRunId(dynamicTaskRun.getId())
+            .attemptNumber(0)
+            .build();
+
+        RunContextLogger taskRunLogger = new RunContextLogger(this.logEmitter, boundLogEntry, null, false);
+        taskRunLogger.loglevel = this.loglevel; // inherit this context's level filter as-is (logback Level)
+        taskRunLogger.useSecrets.addAll(this.useSecrets);
+        return taskRunLogger;
+    }
+
     private Logger initializeLogger() {
         LoggerContext loggerContext = new LoggerContext();
         LogbackMDCAdapter mdcAdapter = new LogbackMDCAdapter();
@@ -176,12 +323,17 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
         Logger newLogger = loggerContext.getLogger(this.loggerName);
 
         if (this.logEntry != null) {
-            loggerContext.getMDCAdapter().setContextMap(this.logEntry.toMap());
+            // Defensive: populate the per-run LoggerContext's MDC adapter so that any future
+            // code path which reads MDC from the event (rather than from the eager snapshot
+            // set in BaseAppender.transform()) still sees the execution context. Paired with
+            // resetMDC() below on cleanup. Today both are effectively no-ops because the
+            // snapshot in transform() short-circuits event.getMDCPropertyMap().
+            loggerContext.getMDCAdapter().setContextMap(this.mdcContext());
         }
 
         // unit tests don't always have the log queue as we construct a logger directly without it
-        if (this.logQueue != null && !this.logToFile) {
-            ContextAppender contextAppender = new ContextAppender(this, newLogger, this.logQueue, this.logEntry);
+        if (this.logEmitter != null && !this.logToFile) {
+            ContextAppender contextAppender = new ContextAppender(this, newLogger, this.logEmitter, this.logEntry);
             contextAppender.setContext(loggerContext);
             contextAppender.start();
 
@@ -238,7 +390,7 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
             this.logger = logger;
         }
 
-        private String replaceSecret(String data) {
+        protected String replaceSecret(String data) {
             for (String s : runContextLogger.useSecrets) {
                 if (data.contains(s)) {
                     data = data.replace(s, "******");
@@ -253,10 +405,12 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
                 return value
                     .entrySet()
                     .stream()
-                    .map(e -> new AbstractMap.SimpleEntry<>(
-                        recursive(e.getKey()),
-                        recursive(e.getValue())
-                    ))
+                    .map(
+                        e -> new AbstractMap.SimpleEntry<>(
+                            recursive(e.getKey()),
+                            recursive(e.getValue())
+                        )
+                    )
                     .collect(HashMap::new, (m, v) -> m.put(v.getKey(), v.getValue()), HashMap::putAll);
             } else if (object instanceof Collection<?> value) {
                 return value
@@ -310,8 +464,18 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
                     event.getThrowableProxy() instanceof ThrowableProxy throwableProxy ? throwableProxy.getThrowable() : null,
                     argumentArray
                 );
+                // The new LoggingEvent has no MDC by default; pull it from the LogEntry (and
+                // configured labels) so forwarded events carry it
+                if (this.runContextLogger.logEntry != null) {
+                    lle.setMDCPropertyMap(this.runContextLogger.mdcContext());
+                }
                 if (customTimestamp != null) {
                     lle.setTimeStamp(customTimestamp.toEpochMilli());
+                }
+                // the new LoggingEvent starts with no key-value pairs; carry the original ones
+                // over (e.g. PROGRESS_KEY) so logEntry() below can still read them
+                if (event.getKeyValuePairs() != null) {
+                    lle.setKeyValuePairs(event.getKeyValuePairs());
                 }
                 return lle;
             } catch (Throwable e) {
@@ -323,12 +487,12 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
 
     @Slf4j
     public static class ContextAppender extends BaseAppender {
-        private final QueueInterface<LogEntry> logQueue;
+        private final LogEntryEmitter logEmitter;
         private final LogEntry logEntry;
 
-        public ContextAppender(RunContextLogger runContextLogger, Logger logger, QueueInterface<LogEntry> logQueue, LogEntry logEntry) {
+        public ContextAppender(RunContextLogger runContextLogger, Logger logger, LogEntryEmitter logEmitter, LogEntry logEntry) {
             super(runContextLogger, logger);
-            this.logQueue = logQueue;
+            this.logEmitter = logEmitter;
             this.logEntry = logEntry;
         }
 
@@ -336,11 +500,13 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
         protected void append(ILoggingEvent e) {
             e = this.transform(e);
 
-            try {
-                logQueue.emitAsync(logEntries(e, logEntry));
-            } catch (QueueException ex) {
-                log.warn("Unable to emit logQueue", ex);
-            }
+            // transform() only masks the log statement's own message/args; an attached
+            // exception's message and stack trace (built into these entries below) carry the
+            // original exception content untouched, so mask them here too.
+            var entries = logEntries(e, logEntry).stream()
+                .map(entry -> entry.toBuilder().message(replaceSecret(entry.getMessage())).build())
+                .toList();
+            logEmitter.emits(entries);
         }
     }
 
@@ -367,7 +533,7 @@ public class RunContextLogger implements Supplier<org.slf4j.Logger> {
             e = this.transform(e);
 
             try {
-                String line = PATTERN_LAYOUT.doLayout(e);
+                String line = replaceSecret(PATTERN_LAYOUT.doLayout(e));
                 fileOS.write(line.getBytes());
             } catch (IOException ex) {
                 // silently do nothing, the message will still be forwarded to the server log

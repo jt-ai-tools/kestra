@@ -1,6 +1,18 @@
 package io.kestra.core.services;
 
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import io.kestra.core.models.MaintenanceStatusResponse;
+import io.kestra.core.models.MaintenanceStatusResponse.ServiceStatus;
+import io.kestra.core.server.Service.ServiceState;
+import io.kestra.core.server.ServiceInstance;
+import io.kestra.core.server.ServiceLivenessStore;
+import io.kestra.core.server.ServiceType;
 import io.kestra.core.utils.Disposable;
+
 import jakarta.inject.Singleton;
 
 public interface MaintenanceService {
@@ -21,23 +33,59 @@ public interface MaintenanceService {
     Disposable listen(final MaintenanceListener listener);
 
     /**
+     * Builds the current maintenance status including per-service readiness.
+     *
+     * @param livenessStore the store to query running service instances.
+     * @return a {@link MaintenanceStatusResponse}.
+     */
+    default MaintenanceStatusResponse getMaintenanceStatus(ServiceLivenessStore livenessStore) {
+        boolean maintenance = isInMaintenanceMode();
+        List<ServiceInstance> allRunning = livenessStore.findAllInstancesInStates(ServiceState.allRunningStates());
+
+        Map<ServiceType, ServiceStatus> services = allRunning.stream()
+            .collect(Collectors.groupingBy(ServiceInstance::type))
+            .entrySet()
+            .stream()
+            .sorted(Map.Entry.comparingByKey())
+            .collect(
+                Collectors.toMap(
+                    Map.Entry::getKey,
+                    entry ->
+                    {
+                        int inMaintenance = (int) entry.getValue().stream()
+                            .filter(si -> ServiceState.MAINTENANCE.equals(si.state()))
+                            .count();
+                        return new ServiceStatus(entry.getValue().size(), inMaintenance);
+                    },
+                    (a, b) -> a,
+                    LinkedHashMap::new
+                )
+            );
+
+        boolean ready = maintenance && !allRunning.isEmpty() && allRunning.stream()
+            .allMatch(si -> ServiceState.MAINTENANCE.equals(si.state()));
+
+        return new MaintenanceStatusResponse(maintenance, ready, services);
+    }
+
+    /**
      * Interface for listening on maintenance events.
      */
     interface MaintenanceListener {
         /**
-         * Invoked when cluster is entering maintenance mode.
+         * Invoked when the cluster is entering maintenance mode.
          */
         void onMaintenanceModeEnter();
 
         /**
-         * Invoked when cluster is exiting maintenance mode.
+         * Invoked when the cluster is exiting maintenance mode.
          */
         void onMaintenanceModeExit();
     }
 
     /**
      * Noop {@link MaintenanceService} implementation.
-     *<p>
+     * <p>
      * Maintenance mode is EE feature.
      */
     @Singleton
@@ -50,7 +98,9 @@ public interface MaintenanceService {
 
         @Override
         public Disposable listen(MaintenanceListener listener) {
-            return Disposable.of(() -> {}); // NOOP
+            return Disposable.of(() ->
+            {
+            }); // NOOP
         }
     }
 }

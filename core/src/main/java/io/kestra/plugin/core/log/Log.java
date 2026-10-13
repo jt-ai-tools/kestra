@@ -1,5 +1,10 @@
 package io.kestra.plugin.core.log;
 
+import java.util.Collection;
+
+import org.slf4j.Logger;
+import org.slf4j.event.Level;
+
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.annotations.PluginProperty;
@@ -8,14 +13,11 @@ import io.kestra.core.models.tasks.RunnableTask;
 import io.kestra.core.models.tasks.Task;
 import io.kestra.core.models.tasks.VoidOutput;
 import io.kestra.core.runners.RunContext;
+
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
 import lombok.*;
 import lombok.experimental.SuperBuilder;
-import org.slf4j.Logger;
-import org.slf4j.event.Level;
-
-import java.util.Collection;
 
 import static io.kestra.core.utils.Rethrow.throwConsumer;
 
@@ -61,8 +63,7 @@ import static io.kestra.core.utils.Rethrow.throwConsumer;
                       - Kestra team wishes you a great day 👋
                       - If you need some help, reach out via Slack"""
         ),
-    },
-    aliases = "io.kestra.core.tasks.log.Log"
+    }
 )
 public class Log extends Task implements RunnableTask<VoidOutput> {
     @Schema(
@@ -83,21 +84,19 @@ public class Log extends Task implements RunnableTask<VoidOutput> {
     @Builder.Default
     private Property<Level> level = Property.ofValue(Level.INFO);
 
-    @SuppressWarnings("unchecked")
     @Override
     public VoidOutput run(RunContext runContext) throws Exception {
         Logger logger = runContext.logger();
 
         var renderedLevel = runContext.render(this.level).as(Level.class).orElseThrow();
 
-        if(this.message instanceof String stringValue) {
+        if (this.message instanceof String stringValue) {
             String render = runContext.render(stringValue);
             this.log(logger, renderedLevel, render);
         } else if (this.message instanceof Collection<?> collectionValue) {
-            Collection<String> messages = (Collection<String>) collectionValue;
-            messages.forEach(throwConsumer(message -> {
-                String render;
-                render = runContext.render(message);
+            collectionValue.forEach(throwConsumer(message ->
+            {
+                String render = runContext.render(String.valueOf(message));
                 this.log(logger, renderedLevel, render);
             }));
         } else {
@@ -129,4 +128,3 @@ public class Log extends Task implements RunnableTask<VoidOutput> {
         }
     }
 }
-

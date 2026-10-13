@@ -1,10 +1,11 @@
 <template>
-    <LeftMenu v-if="miscStore.configs && !layoutStore.sideMenuCollapsed" @menu-collapse="onMenuCollapse" />
+    <LeftMenu v-if="miscStore.configs" :collapsed="layoutStore.sideMenuCollapsed" @menu-collapse="onMenuCollapse" />
+    <RouteTabsSidebar v-if="miscStore.configs" />
     <main>
         <Errors v-if="coreStore.error" :code="coreStore.error" />
         <slot v-else />
     </main>
-    <ContextInfoBar v-if="miscStore.configs" />
+    <ContextDrawer v-if="miscStore.configs" />
 
     <SurveyDialog
         :visible="showSurveyDialog"
@@ -14,14 +15,16 @@
 
 <script setup lang="ts">
     import LeftMenu from "override/components/LeftMenu.vue"
+    import RouteTabsSidebar from "../../../components/layout/RouteTabsSidebar.vue"
     import Errors from "../../../components/errors/Errors.vue"
-    import ContextInfoBar from "../../../components/ContextInfoBar.vue"
+    import ContextDrawer from "../../../components/ContextDrawer.vue"
     import SurveyDialog from "../../../components/SurveyDialog.vue"
     import {onMounted, ref, watch} from "vue"
     import {useSurveySkip} from "../../../composables/useSurveyData"
     import {useCoreStore} from "../../../stores/core"
     import {useMiscStore} from "override/stores/misc"
     import {useLayoutStore} from "../../../stores/layout"
+    import {storageKeys} from "../../../utils/constants"
 
     const coreStore = useCoreStore()
     const miscStore = useMiscStore()
@@ -36,11 +39,11 @@
     function handleSurveyDialogClose() {
         showSurveyDialog.value = false
         markSurveyDialogShown()
-        localStorage.removeItem("showSurveyDialogAfterLogin")
+        localStorage.removeItem(storageKeys.SHOW_SURVEY_DIALOG_AFTER_LOGIN)
     }
 
     function checkForSurveyDialog() {
-        const shouldShow = localStorage.getItem("showSurveyDialogAfterLogin") === "true"
+        const shouldShow = localStorage.getItem(storageKeys.SHOW_SURVEY_DIALOG_AFTER_LOGIN) === "true"
         if (shouldShow) {
             setTimeout(() => {
                 showSurveyDialog.value = true

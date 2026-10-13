@@ -1,29 +1,41 @@
 package io.kestra.core.models.hierarchies;
 
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import com.fasterxml.jackson.annotation.JsonCreator;
+
 import io.kestra.core.exceptions.IllegalVariableEvaluationException;
 import io.kestra.core.exceptions.InternalException;
 import io.kestra.core.models.executions.Execution;
 import io.kestra.core.models.executions.TaskRun;
-import io.kestra.core.models.flows.Flow;
 import io.kestra.core.models.flows.FlowInterface;
 import io.kestra.core.models.tasks.*;
 import io.kestra.core.runners.FlowMetaStoreInterface;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.runners.SubflowExecution;
 import io.kestra.core.runners.SubflowExecutionResult;
-import lombok.Getter;
 
-import java.util.List;
-import java.util.Optional;
+import lombok.Getter;
 
 @Getter
 public class SubflowGraphTask extends AbstractGraphTask {
-    public SubflowGraphTask(String uid, ExecutableTask<?> task, TaskRun taskRun, List<String> values, RelationType relationType) {
+    private final boolean disabled;
+
+    @JsonCreator
+    public SubflowGraphTask(String uid, ExecutableTask<?> task, TaskRun taskRun, List<String> values, RelationType relationType, boolean disabled) {
         super(uid, (TaskInterface) task, taskRun, values, relationType);
+        this.disabled = disabled;
     }
 
     public SubflowGraphTask(ExecutableTask<?> task, TaskRun taskRun, List<String> values, RelationType relationType) {
+        this(task, taskRun, values, relationType, false);
+    }
+
+    public SubflowGraphTask(ExecutableTask<?> task, TaskRun taskRun, List<String> values, RelationType relationType, boolean disabled) {
         super((TaskInterface) task, taskRun, values, relationType);
+        this.disabled = disabled;
     }
 
     public ExecutableTask<?> executableTask() {
@@ -36,25 +48,35 @@ public class SubflowGraphTask extends AbstractGraphTask {
     }
 
     public SubflowGraphTask withRenderedSubflowId(RunContext runContext) {
-        SubflowGraphTask previous = this;
-        return new SubflowGraphTask(this.getUid(), new SubflowTaskWrapper<>(runContext, this.executableTask()), this.getTaskRun(), this.getValues(), this.getRelationType()) {
-            @Override
-            public int hashCode() {
-                // Since edges are handled by a hashmap, we need to keep the same hash and uid is not a good candidate as it changes whenever a node is moved to a cluster
-                return previous.hashCode();
-            }
-        };
+        return withRenderedSubflowId(runContext, this.disabled);
+    }
+
+    public SubflowGraphTask withRenderedSubflowId(RunContext runContext, boolean disabled) {
+        return copy(new SubflowTaskWrapper<>(runContext, this.executableTask()), disabled);
+    }
+
+    public SubflowGraphTask withDisabled(boolean disabled) {
+        return copy(this.executableTask(), disabled);
+    }
+
+    private SubflowGraphTask copy(ExecutableTask<?> task, boolean disabled) {
+        SubflowGraphTask copy = new SubflowGraphTask(this.getUid(), task, this.getTaskRun(), this.getValues(), this.getRelationType(), disabled);
+        if (this.getBranchType() != null) {
+            copy.updateWithChildren(this.getBranchType());
+        }
+        return copy;
     }
 
     public record SubflowTaskWrapper<T extends Output>(RunContext runContext, ExecutableTask<T> subflowTask) implements TaskInterface, ExecutableTask<T> {
         @Override
-        public List<SubflowExecution<?>> createSubflowExecutions(RunContext runContext, FlowMetaStoreInterface flowExecutorInterface, FlowInterface currentFlow, Execution currentExecution, TaskRun currentTaskRun) throws InternalException {
+        public List<SubflowExecution<?>> createSubflowExecutions(RunContext runContext, FlowMetaStoreInterface flowExecutorInterface, FlowInterface currentFlow, Execution currentExecution,
+            TaskRun currentTaskRun) throws InternalException {
             return subflowTask.createSubflowExecutions(runContext, flowExecutorInterface, currentFlow, currentExecution, currentTaskRun);
         }
 
         @Override
-        public Optional<SubflowExecutionResult> createSubflowExecutionResult(RunContext runContext, TaskRun taskRun, FlowInterface flow, Execution execution) {
-            return subflowTask.createSubflowExecutionResult(runContext, taskRun, flow, execution);
+        public Optional<SubflowExecutionResult> createSubflowExecutionResult(RunContext runContext, TaskRun taskRun, FlowInterface flow, Execution execution, Map<String, Object> outputs) {
+            return subflowTask.createSubflowExecutionResult(runContext, taskRun, flow, execution, outputs);
         }
 
         @Override

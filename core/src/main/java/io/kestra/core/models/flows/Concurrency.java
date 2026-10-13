@@ -1,6 +1,5 @@
 package io.kestra.core.models.flows;
 
-import io.micronaut.core.annotation.Introspected;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 import lombok.Builder;
@@ -11,7 +10,6 @@ import lombok.experimental.SuperBuilder;
 @SuperBuilder
 @Getter
 @NoArgsConstructor
-@Introspected
 public class Concurrency {
     @Min(1)
     @NotNull
@@ -21,8 +19,22 @@ public class Concurrency {
     @Builder.Default
     private Behavior behavior = Behavior.QUEUE;
 
+    @Min(1)
+    private Integer queueLimit;
+
     public enum Behavior {
-        QUEUE, CANCEL, FAIL;
+        QUEUE,
+        CANCEL,
+        FAIL;
+    }
+
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    @jakarta.validation.constraints.AssertTrue(message = "queueLimit is only valid with QUEUE behavior")
+    public boolean isValidQueueLimit() {
+        if (queueLimit != null) {
+            return behavior == Behavior.QUEUE;
+        }
+        return true;
     }
 
     public static boolean possibleTransitions(State.Type type) {

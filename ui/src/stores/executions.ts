@@ -1,770 +1,822 @@
-import {defineStore} from "pinia";
-import {ref, watch} from "vue";
-import {apiUrl} from "override/utils/route";
-import Utils from "../utils/utils";
-import {useCoreStore} from "./core";
-import throttle from "lodash/throttle";
-import {useRoute} from "vue-router";
-import {CLUSTER_PREFIX} from "@kestra-io/ui-libs/src/utils/constants.ts";
-import {useAxios} from "../utils/axios";
+import {ref, watch} from "vue"
+import {defineStore} from "pinia"
+import {useRoute, type LocationQuery} from "vue-router"
+import {CLUSTER_PREFIX, throttle} from "@kestra-io/design-system"
+import {
+    TaskRun,
+    useClient,
+    type Check,
+    type Execution as SDKExecution,
+    type ExecutionControllerApiValidateExecutionInputsResponseApiInputError as InputError,
+    type ExecutionRepositoryInterfaceFlowFilter,
+    type FlowForExecution,
+    type Label,
+    type Level,
+    type LogEntry,
+    type PagedResultsApiLightExecution,
+    type StateType,
+} from "@kestra-io/kestra-sdk"
+import * as ExecutionsAPI from "@kestra-io/kestra-sdk/executions"
+import * as LogsAPI from "@kestra-io/kestra-sdk/logs"
+import type {FlowGraph} from "@kestra-io/topology/vue-flow-utils"
+import {apiUrl} from "override/utils/route"
+import * as Utils from "../utils/utils"
+import {Optional} from "../utils/utils"
+import * as ExecutionUtils from "../utils/executionUtils"
+import {routeQueryToQueryFilters} from "../utils/queryFilters"
+import {executionLogsDownloadFilename} from "../utils/logs"
+import {InputType} from "../utils/inputs"
+import {executionLocation, isExampleFlow} from "../utils/analytics/activation"
+import type {KestraRequestOptions} from "../utils/kestraHttp"
+import {useCoreStore} from "./core"
+import {useApiStore} from "./api"
 
-interface LogsState {
-    total: number;
-    results: any[];
+export type {Label, StateHistory as Histories} from "@kestra-io/kestra-sdk"
+
+export type {Check, ExecutionControllerApiValidateExecutionInputsResponseApiInputError as InputError} from "@kestra-io/kestra-sdk"
+
+export interface ValidationResponse {
+    checks?: Check[];
+    inputs: Array<{
+        enabled: boolean;
+        input: InputMetaData;
+        errors?: InputError[];
+        value?: unknown;
+        isDefault?: boolean;
+    }>;
 }
 
-export interface Label{
-    key: string;
-    value: string;
+export interface ValidationEventPayload {
+    formData: FormData | undefined;
+    inputsMetaData: InputMetaData[];
+    callback: (response: ValidationResponse) => void;
 }
 
-export type Histories = {
-    state: string;
-    date: string;
-}
+export type ValueOptionLike = string | {label: string; value: string};
 
-export interface Execution{
+export interface InputMetaData {
     id: string;
-    namespace: string;
-    flowId: string;
+    type: InputType
+    displayName?: string;
+    description?: string;
+    required?: boolean;
+    defaults?: unknown;
+    value?: unknown;
+    values?: ValueOptionLike[];
+    options?: ValueOptionLike[];
+    errors?: InputError[];
+    isDefault?: boolean;
+    isRadio?: boolean;
+    allowCustomValue?: boolean;
+    min?: number;
+    max?: number;
+    allowedFileExtensions?: string[];
+    accept?: string;
+    prefill?: unknown;
+    /** Only on the raw flow inputs: the validate response strips it, keeping `dependsOn` at most. */
+    expression?: string;
+    dependsOn?: unknown;
+    /** Set on a FORM input only: the children it groups, mirroring the backend `FormInput.inputs`. */
+    inputs?: InputMetaData[];
+}
+
+/** Mirrors the backend `FilePreview`: `content` is renderer-specific (text, rows, base64, ...). */
+export interface FilePreview {
+    extension?: string;
+    type?: "TEXT" | "LIST" | "IMAGE" | "MARKDOWN" | "PDF";
+    content?: unknown;
+    truncated?: boolean;
+}
+
+export type Execution = Omit<Optional<SDKExecution, "deleted" | "metadata" | "originalId">, "taskRunList"> & {
     tenantId?: string;
-    taskRunList:  {
-        id: string,
-        taskId: string,
-        value?: string
-        executionId?: string
-        outputs?: Record<string, any>
-    }[]
-    state: {
-        current: string;
-        history: string;
-        startDate: string;
-        duration: string;
-        endDate?: string;
-        histories?: Histories[];
+    taskRunList?: Optional<TaskRun, "namespace" | "executionId" | "flowId">[];
+    inputs?: Record<string, unknown>;
+    variables?: Record<string, unknown>;
+}
+
+/** A route query whose `filters[...]` keys reach the backend as filters, left open because the
+ *  bulk-action dispatcher merges the action's own options into the same bag (see `Executions.vue`). */
+type FilterQuery = Record<string, unknown>
+
+/** Route query of the executions list plus the paging and commit options `findExecutions` reads. */
+type ExecutionSearchOptions = FilterQuery & {
+    page?: number;
+    size?: number;
+    sort?: string;
+    /** `false` returns the page without replacing the store's `executions`/`total`. */
+    commit?: boolean;
+    onlyTotal?: boolean;
+}
+
+type DeleteExecutionOptions = {
+    includeNonTerminated?: boolean;
+    deleteLogs?: boolean;
+    deleteMetrics?: boolean;
+    deleteStorage?: boolean;
+}
+
+type GraphOptions = {
+    id: string;
+    /** `subflows` lists the subflow paths whose own graph is expanded inline. */
+    params?: { subflows?: string[] };
+}
+
+type FlowGraphNode = FlowGraph["nodes"][number]
+
+/** Renders an ION preview of scalar rows as text, a workaround for https://github.com/kestra-io/plugin-aws/issues/456. */
+export function normalizeFilePreview(data: FilePreview): FilePreview {
+    const rows = data?.content
+    if (data?.extension !== "ion" || !Array.isArray(rows)) {
+        return data
     }
-    trigger?: {
-        id: any;
-        type: string;
-        variables: {
-            executionId: string;
-        }
-    },
-    metadata: {
-        originalCreatedDate: string;
-        attemptNumber: number;
-    },
-    inputs?: Record<string, any>;
-    labels?: Label[];
-    variables?: Record<string, any>;
-    outputs?: Record<string, any>;
-    originalId?: string;
-    flowRevision?: number;
-    scheduleDate?: string;
+
+    const notObjects = rows.some((row: unknown) => typeof row !== "object")
+
+    if (!notObjects) {
+        return data
+    }
+
+    const content = rows.length === 1 ? rows[0] : rows.join("\n")
+    return {...data, type: "TEXT", content}
 }
 
 export const useExecutionsStore = defineStore("executions", () => {
-    // State
-    const executions = ref<Execution[] | undefined>(undefined);
-    const execution = ref<Execution | undefined>(undefined);
-    const taskRun = ref<any | undefined>(undefined);
-    const total = ref<number>(0);
-    const logs = ref<LogsState>({
-        total: 0,
-        results: []
-    });
-    const metrics = ref<any[]>([]);
-    const metricsTotal = ref<number>(0);
-    const subflowsExecutions = ref<Record<string, any>>({});
-    const flow = ref<any | undefined>(undefined);
-    const flowGraph = ref<any | undefined>(undefined);
-    const namespaces = ref<string[]>([]);
-    const flowsExecutable = ref<any[]>([]);
+    const executions = ref<Execution[] | undefined>(undefined)
+    const execution = ref<Execution | undefined>(undefined)
+    const total = ref<number>(0)
+    const logs = ref<LogEntry[]>([])
+    const subflowsExecutions = ref<Record<string, Execution>>({})
+    /** Lifecycle-step progress plugins report mid-run, read off the follow-logs stream.
+     *  Never reset across navigations: a taskRunId is globally unique. */
+    const progressEvents = ref<{taskId: string; taskRunId: string; step: string; timestamp: string}[]>([])
+    const flow = ref<FlowForExecution | undefined>(undefined)
+    const flowGraph = ref<FlowGraph | undefined>(undefined)
+    const taskRunSelections = ref<Map<string, string>>(new Map())
+    const namespaces = ref<string[]>([])
+    const flowsExecutable = ref<FlowForExecution[]>([])
 
-    // clear flow graph when execution is reset
-    // since it is supposed to represent the current execution's flow
     watch(execution, (newExecution) => {
         if(!newExecution){
-            flowGraph.value = undefined;
-            flow.value = undefined;
+            flowGraph.value = undefined
+            flow.value = undefined
+            taskRunSelections.value.clear()
         }
-    });
+    })
 
-    const coreStore = useCoreStore();
-    const axios = useAxios();
+    const coreStore = useCoreStore()
+    const axios = useClient()
+    const route = useRoute()
 
-    // Actions
-    const restartExecution = (options: { executionId: string; revision?: number }) => {
-        return axios.post(
-            `${apiUrl()}/executions/${options.executionId}/restart`,
-            null,
-            {
-                params: {
-                    revision: options.revision
-                }
-            })
+    const restartExecution = (options: { executionId: string }) => {
+        return ExecutionsAPI.restartExecution({executionId: options.executionId}) as unknown as Promise<Execution>
     }
 
     const bulkRestartExecution = (options: { executionsId: string[] }) => {
-        return axios.post(
-            `${apiUrl()}/executions/restart/by-ids`,
-            options.executionsId
-        )
+        return ExecutionsAPI.restartExecutionsByIds({body: options.executionsId})
     }
 
-    const queryRestartExecution = (options: Record<string, any>) => {
-        return axios.post(
-            `${apiUrl()}/executions/restart/by-query`,
-            {},
-            {params: options}
-        )
+    const queryRestartExecution = (options: FilterQuery) => {
+        return ExecutionsAPI.restartExecutionsByQuery({filters: routeQueryToQueryFilters(options)})
     }
 
     const bulkResumeExecution = (options: { executionsId: string[] }) => {
-        return axios.post(
-            `${apiUrl()}/executions/resume/by-ids`,
-            options.executionsId
-        )
+        return ExecutionsAPI.resumeExecutionsByIds({body: options.executionsId})
     }
 
-    const queryResumeExecution = (options: Record<string, any>) => {
-        return axios.post(
-            `${apiUrl()}/executions/resume/by-query`,
-            {},
-            {params: options}
-        )
+    const queryResumeExecution = (options: FilterQuery) => {
+        return ExecutionsAPI.resumeExecutionsByQuery({filters: routeQueryToQueryFilters(options)})
     }
 
-    const bulkReplayExecution = (options: { executionsId: string[] } & Record<string, any>) => {
-        return axios.post(
-            `${apiUrl()}/executions/replay/by-ids`,
-            options.executionsId,
-            {params: options}
-        )
+    const bulkReplayExecution = (options: { executionsId: string[]; latestRevision?: boolean }) => {
+        return ExecutionsAPI.replayExecutionsByIds({body: options.executionsId, latestRevision: options.latestRevision})
     }
 
-    const bulkChangeExecutionStatus = (options: { executionsId: string[]; newStatus: string }) => {
-        return axios.post(
-            `${apiUrl()}/executions/change-status/by-ids`,
-            options.executionsId,
-            {
-                params: {
-                    newStatus: options.newStatus
-                }
-            }
-        )
+    const bulkChangeExecutionStatus = (options: { executionsId: string[]; newStatus: StateType }) => {
+        return ExecutionsAPI.updateExecutionsStatusByIds({body: options.executionsId, newStatus: options.newStatus})
     }
 
-    const queryReplayExecution = (options: Record<string, any>) => {
-        return axios.post(
-            `${apiUrl()}/executions/replay/by-query`,
-            {},
-            {params: options}
-        )
+    const queryReplayExecution = (options: FilterQuery & { latestRevision?: boolean }) => {
+        return ExecutionsAPI.replayExecutionsByQuery({filters: routeQueryToQueryFilters(options), latestRevision: options.latestRevision})
     }
 
-    const queryChangeExecutionStatus = (options: Record<string, any>) => {
-        return axios.post(
-            `${apiUrl()}/executions/change-status/by-query`,
-            {},
-            {params: options}
-        )
+    const queryChangeExecutionStatus = (options: FilterQuery & { newStatus: StateType }) => {
+        return ExecutionsAPI.updateExecutionsStatusByQuery({filters: routeQueryToQueryFilters(options), newStatus: options.newStatus})
     }
 
     const replayExecution = (options: { executionId: string; taskRunId?: string; revision?: number, breakpoints?: string[] }) => {
-        return axios.post<Execution>(
-            `${apiUrl()}/executions/${options.executionId}/replay`,
-            null,
-            {
-                params: {
-                    taskRunId: options.taskRunId,
-                    revision: options.revision,
-                    breakpoints: options.breakpoints ? options.breakpoints : undefined
-                }
-            })
+        return ExecutionsAPI.replayExecution({
+            executionId: options.executionId,
+            taskRunId: options.taskRunId,
+            revision: options.revision,
+            breakpoints: options.breakpoints ? options.breakpoints.join(",") : undefined,
+        }) as unknown as Promise<Execution>
     }
 
+    /** Multipart with file inputs, so it stays on the raw client. Never set Content-Type: the browser adds the boundary. */
     const replayExecutionWithInputs = (options: { executionId: string; taskRunId?: string; revision?: number, breakpoints?: string[], formData?: FormData }) => {
-        return axios.post(
-            `${apiUrl()}/executions/${options.executionId}/replay-with-inputs`,
+        return axios.post<Execution>(
+            `${apiUrl()}/executions/${options.executionId}/actions/replay-with-inputs`,
             options.formData,
             {
                 params: {
                     taskRunId: options.taskRunId,
                     revision: options.revision,
-                    breakpoints: options.breakpoints ? options.breakpoints : undefined
+                    breakpoints: options.breakpoints ? options.breakpoints.join(",") : undefined,
                 },
-                headers: {
-                    "Content-Type": "multipart/form-data"
-                }
-            })
+            }).then(response => response.data)
     }
 
     const changeExecutionStatus = (options: { executionId: string; state: string }) => {
-        return axios.post(
-            `${apiUrl()}/executions/${options.executionId}/change-status`,
-            null,
-            {
-                params: {
-                    status: options.state
-                }
-            })
+        return ExecutionsAPI.updateExecutionStatus({executionId: options.executionId, status: options.state as Parameters<typeof ExecutionsAPI.updateExecutionStatus>[0]["status"]}) as unknown as Promise<Execution>
     }
 
     const changeStatus = (options: { executionId: string; taskRunId?: string; state: string }) => {
-        return axios.post(
-            `${apiUrl()}/executions/${options.executionId}/state`,
-            {
-                taskRunId: options.taskRunId,
-                state: options.state,
-            })
+        return ExecutionsAPI.updateTaskRunState({
+            executionId: options.executionId,
+            taskRunId: options.taskRunId!,
+            state: options.state as Parameters<typeof ExecutionsAPI.updateTaskRunState>[0]["state"],
+        }) as unknown as Promise<Execution>
+    }
+
+    const interrupt = (options: { executionId: string; taskRunId: string; state: string }) => {
+        return axios.post(`${apiUrl()}/executions/${options.executionId}/actions/interrupt`, {
+            taskRunId: options.taskRunId,
+            state: options.state,
+        })
+    }
+
+    const waitForStateChange = async (source: Execution) => {
+        const updated = await ExecutionUtils.waitForState(axios, source) as Execution
+        execution.value = updated
+        return updated
     }
 
     const kill = (options: { id: string; isOnKillCascade?: boolean }) => {
-        return axios.delete(`${apiUrl()}/executions/${options.id}/kill?isOnKillCascade=${options.isOnKillCascade}`);
+        return ExecutionsAPI.killExecution({executionId: options.id, isOnKillCascade: options.isOnKillCascade}) as unknown as Promise<Execution>
     }
 
     const bulkKill = (options: { executionsId: string[] }) => {
-        return axios.delete(`${apiUrl()}/executions/kill/by-ids`, {data: options.executionsId});
+        return ExecutionsAPI.killExecutionsByIds({body: options.executionsId})
     }
 
-    const queryKill = (options: Record<string, any>) => {
-        return axios.delete(`${apiUrl()}/executions/kill/by-query`, {params: options});
+    const queryKill = (options: FilterQuery) => {
+        return ExecutionsAPI.killExecutionsByQuery({filters: routeQueryToQueryFilters(options)})
     }
 
-    const resume = (options: { id: string; formData: any }) => {
-        return axios.post(`${apiUrl()}/executions/${options.id}/resume`, Utils.toFormData(options.formData), {
+    /** Multipart with file inputs, so it stays on the raw client. Never set Content-Type: the browser adds the boundary. */
+    const resume = (options: { id: string; formData?: FormData }) => {
+        return axios.post<Execution>(`${apiUrl()}/executions/${options.id}/actions/resume`, Utils.toFormData(options.formData ?? {}), {
             timeout: 60 * 60 * 1000,
-            headers: {
-                "content-type": "multipart/form-data"
-            }
-        });
+        }).then(response => response.data)
     }
 
-    const validateResume = (options: { id: string; formData: any }) => {
-        return axios.post(`${apiUrl()}/executions/${options.id}/resume/validate`, Utils.toFormData(options.formData), {
+    /** Multipart with file inputs, so it stays on the raw client. Never set Content-Type: the browser adds the boundary. */
+    const validateResume = (options: { id: string; formData?: FormData }) => {
+        return axios.post<ValidationResponse>(`${apiUrl()}/executions/${options.id}/actions/resume/validate`, Utils.toFormData(options.formData ?? {}), {
             timeout: 60 * 60 * 1000,
-            headers: {
-                "content-type": "multipart/form-data"
-            }
-        });
+        }).then(response => response.data)
+    }
+
+    const resumeFromBreakpoint = (options: { id: string; breakpoints?: string[] }) => {
+        return ExecutionsAPI.resumeExecutionFromBreakpoint({
+            executionId: options.id,
+            breakpoints: options.breakpoints ? options.breakpoints.join(",") : undefined,
+        }) as unknown as Promise<Execution>
     }
 
     const pause = (options: { id: string }) => {
-        return axios.post(`${apiUrl()}/executions/${options.id}/pause`);
+        return ExecutionsAPI.pauseExecution({executionId: options.id}) as unknown as Promise<Execution>
     }
 
     const bulkPauseExecution = (options: { executionsId: string[] }) => {
-        return axios.post(
-            `${apiUrl()}/executions/pause/by-ids`,
-            options.executionsId
-        )
+        return ExecutionsAPI.pauseExecutionsByIds({body: options.executionsId})
     }
 
-    const queryPauseExecution = (options: Record<string, any>) => {
-        return axios.post(
-            `${apiUrl()}/executions/pause/by-query`,
-            {},
-            {params: options}
-        )
+    const queryPauseExecution = (options: FilterQuery) => {
+        return ExecutionsAPI.pauseExecutionsByQuery({filters: routeQueryToQueryFilters(options)})
     }
 
-    const loadExecution = (options: { id: string }) => {
-        return axios.get(`${apiUrl()}/executions/${options.id}`).then(response => {
-            execution.value = response.data;
-            return response.data;
+    let latestExecutionLoad = 0
+
+    /** A superseded load is dropped, as in `stores/logs.ts`, and cancels the pending throttled update so a
+     *  trailing event from the previous execution's stream cannot land on top of this one. */
+    const loadExecution = (options: { id: string }, requestOptions?: KestraRequestOptions) => {
+        const load = ++latestExecutionLoad
+        return ExecutionsAPI.execution({executionId: options.id}, requestOptions).then(data => {
+            if (load !== latestExecutionLoad) return data
+
+            throttledExecutionUpdate.cancel()
+            execution.value = data
+            return execution.value
         })
     }
 
-    const findExecutions = (options: { commit?: boolean } & Record<string, any>) => {
-        return axios.get(`${apiUrl()}/executions/search`, {params: options}).then(response => {
+    function toExecutionSearchParams(options: ExecutionSearchOptions) {
+        return {
+            page: options.page,
+            size: options.size,
+            sort: options.sort ? [options.sort] : undefined,
+            filters: routeQueryToQueryFilters(options),
+        }
+    }
+
+    /** With `onlyTotal`, resolves to the number of matches instead of the page of results. */
+    function findExecutions(options: ExecutionSearchOptions & { onlyTotal: true }): Promise<number>
+    function findExecutions(options: ExecutionSearchOptions): Promise<PagedResultsApiLightExecution>
+    function findExecutions(options: ExecutionSearchOptions): Promise<PagedResultsApiLightExecution | number> {
+        return ExecutionsAPI.searchExecutions(toExecutionSearchParams(options)).then(response => {
             if (options.commit !== false) {
-                executions.value = response.data.results;
-                total.value = response.data.total;
+                executions.value = response.results as unknown as Execution[]
+                total.value = response.total ?? 0
             }
 
             if (options.onlyTotal) {
-                return response.data.total;
+                return response.total
             }
 
-            return response.data;
+            return response
         })
     }
 
-    const validateExecution = (options: { namespace: string; id: string; formData: any; labels?: string[]; scheduleDate?: string }) => {
-        return axios.post(`${apiUrl()}/executions/${options.namespace}/${options.id}/validate`, Utils.toFormData(options.formData), {
+    const findDistinctFieldValues = async (options: {
+        field: string;
+        filters?: LocationQuery;
+        size?: number;
+    }): Promise<string[]> => {
+        return ExecutionsAPI.findDistinctFieldValues({
+            field: options.field as Parameters<typeof ExecutionsAPI.findDistinctFieldValues>[0]["field"],
+            filters: options.filters ? routeQueryToQueryFilters(options.filters) : undefined,
+            size: options.size ?? 100,
+        })
+    }
+
+    /** Multipart with file inputs, so it stays on the raw client. Never set Content-Type: the browser adds the boundary. */
+    const validateExecution = (options: { namespace: string; id: string; formData?: FormData; labels?: string[]; scheduleDate?: string }) => {
+        return axios.post<ValidationResponse>(`${apiUrl()}/executions/${options.namespace}/${options.id}/validate`, Utils.toFormData(options.formData ?? {}), {
             timeout: 60 * 60 * 1000,
-            headers: {
-                "content-type": "multipart/form-data"
-            },
             params: {
                 labels: options.labels ?? [],
-                scheduleDate: options.scheduleDate
-            }
-        })
+                scheduleDate: options.scheduleDate,
+            },
+        }).then(response => response.data)
     }
 
+    /** The SDK types the multipart body as `Blob[]`, but its serializer runs `Object.entries(body)`, so the input values
+     *  object is sent as is. Never set Content-Type: the browser adds the boundary. */
     const triggerExecution = (options: {
         namespace: string;
         id: string;
-        formData: any;
+        formData?: Record<string, unknown>;
         kind: "PLAYGROUND" | "NORMAL"
         breakpoints?: string[];
         labels?: string[];
         scheduleDate?: string,
+        revision?: number,
     }) => {
-        return axios.post<Execution>(`${apiUrl()}/executions/${options.namespace}/${options.id}`, Utils.toFormData(options.formData), {
-            timeout: 60 * 60 * 1000,
-            headers: {
-                "content-type": "multipart/form-data"
-            },
-            params: {
-                labels: options.labels ?? [],
-                scheduleDate: options.scheduleDate,
-                kind: options.kind,
-                breakpoints: options.breakpoints ? options.breakpoints.join(",") : undefined
-            }
+        return ExecutionsAPI.createExecution({
+            namespace: options.namespace,
+            id: options.id,
+            body: options.formData as unknown as Parameters<typeof ExecutionsAPI.createExecution>[0]["body"],
+            labels: options.labels ?? [],
+            scheduleDate: options.scheduleDate,
+            kind: options.kind,
+            breakpoints: options.breakpoints ? options.breakpoints.join(",") : undefined,
+            revision: options.revision,
+        }, {timeout: 60 * 60 * 1000}).then(execution => {
+            useApiStore().posthogEvents({
+                type: "FLOW_EXECUTION",
+                action: "executed",
+                execution_id: execution.id,
+                namespace: execution.namespace,
+                flow_id: execution.flowId,
+                location: executionLocation(route.name?.toString(), options.kind),
+                is_example: isExampleFlow(execution.namespace),
+                revision: execution.flowRevision,
+            })
+
+            return execution
         })
     }
 
     const deleteExecution = (options: { id: string; deleteLogs?: boolean; deleteMetrics?: boolean; deleteStorage?: boolean }) => {
-        const {id, deleteLogs, deleteMetrics, deleteStorage} = options;
-        const qs = Object.entries({deleteLogs, deleteMetrics, deleteStorage})
-            .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
-            .join("&");
-
-        return axios.delete(`${apiUrl()}/executions/${id}?${qs}`).then(() => {
-            execution.value = undefined;
+        return ExecutionsAPI.deleteExecution({
+            executionId: options.id,
+            deleteLogs: options.deleteLogs,
+            deleteMetrics: options.deleteMetrics,
+            deleteStorage: options.deleteStorage,
+        }).then(() => {
+            execution.value = undefined
         })
     }
 
-    const bulkDeleteExecution = (options: { executionsId: string[] } & Record<string, any>) => {
-        return axios.delete(`${apiUrl()}/executions/by-ids`, {data: options.executionsId, params: {...options}})
+    const bulkDeleteExecution = (options: { executionsId: string[] } & DeleteExecutionOptions) => {
+        const {executionsId, ...rest} = options
+        return ExecutionsAPI.deleteExecutionsByIds({body: executionsId, ...rest})
     }
 
-    const queryDeleteExecution = (options: Record<string, any>) => {
-        return axios.delete(`${apiUrl()}/executions/by-query`, {params: options})
+    const queryDeleteExecution = (options: FilterQuery & DeleteExecutionOptions) => {
+        return ExecutionsAPI.deleteExecutionsByQuery({
+            filters: routeQueryToQueryFilters(options),
+            includeNonTerminated: options.includeNonTerminated,
+            deleteLogs: options.deleteLogs,
+            deleteMetrics: options.deleteMetrics,
+            deleteStorage: options.deleteStorage,
+        })
     }
 
-    const sse = ref<EventSource | undefined>(undefined);
+    const executionSubscription = ref<{ close: () => void } | undefined>(undefined)
 
     function closeSSE() {
-        if (sse.value) {
-            // when closing SSE, the doc seems to say the onerror is called
-            // trying to prevent an unwanted error is displayed for the user
-            sse.value.onerror = () => {};
-
-            sse.value.close();
-            sse.value = undefined;
-        }
+        executionSubscription.value?.close()
+        executionSubscription.value = undefined
     }
 
-    const route = useRoute();
+    const throttledExecutionUpdate = throttle((parsedExecution: Execution) => {
+        const flowValue = flow.value
+        execution.value = parsedExecution
+        const currentExecution = execution.value
 
-    const throttledExecutionUpdate = throttle((executionEvent: MessageEvent) => {
-        const _execution = JSON.parse(executionEvent.data);
-
-        const _flow = flow.value;
-
-        if ((!_flow ||
-            _execution.flowId !== _flow.id ||
-            _execution.namespace !== _flow.namespace ||
-            _execution.flowRevision !== _flow.revision)
+        if ((!flowValue ||
+            parsedExecution.flowId !== flowValue.id ||
+            parsedExecution.namespace !== flowValue.namespace ||
+            parsedExecution.flowRevision !== flowValue.revision)
         ) {
             loadFlowForExecutionByExecutionId(
                 {
-                    id: _execution.id,
-                    revision: route.query.revision?.toString()
-                }
+                    id: parsedExecution.id,
+                    revision: route.query.revision?.toString(),
+                },
             ).then(() => {
-                execution.value = _execution
-            });
+                if (execution.value === currentExecution) {
+                    execution.value = parsedExecution
+                }
+            })
+        }
+    }, 500)
+
+    /** Follows an execution through the SDK stream, skipping the first id-only event. `onEnd` fires once,
+     *  and `onError` too when the stream stops before its "end" event (a 404 or a lost connection). */
+    function subscribeToExecution(
+        executionId: string,
+        handlers: {
+            onExecution: (execution: Execution) => void;
+            onError?: () => void;
+            onEnd?: () => void;
+        },
+    ): { close: () => void } {
+        const controller = new AbortController()
+        let closed = false
+        let finished = false
+        let receivedEnd = false
+
+        const finish = (errored: boolean) => {
+            if (finished || closed) return
+            finished = true
+            if (errored) handlers.onError?.()
+            handlers.onEnd?.()
         }
 
-        execution.value = _execution;
-    }, 500);
-
-    const followExecution = (options: { id: string, rawSSE?: boolean }, translate: (itn: string) => string) => {
-        if (!options.rawSSE) {
-            execution.value = undefined;
-            closeSSE();
-        }
-        const serverSentEventSource = new EventSource(`${apiUrl()}/executions/${options.id}/follow`, {withCredentials: true});
-        if (options.rawSSE) {
-            return Promise.resolve(serverSentEventSource);
-        }
-        sse.value = serverSentEventSource;
-        serverSentEventSource.onmessage = (executionEvent) => {
-            const isEnd = executionEvent && executionEvent.lastEventId === "end";
-            // we are receiving a first "fake" event to force initializing the connection: ignoring it
-            if (executionEvent.lastEventId !== "start") {
-                throttledExecutionUpdate(executionEvent);
-            }
-            if (isEnd) {
-                closeSSE();
-                throttledExecutionUpdate.flush();
-            }
+        const close = () => {
+            if (closed) return
+            closed = true
+            controller.abort()
         }
 
-        // sse.onerror doesn't return the details of the error
-        // but as our emitter can only throw an error on 404
-        // we can safely assume that the error is a 404
-        // if execution is not defined
-        serverSentEventSource.onerror = () => {
-            if (!execution.value) {
-                coreStore.message = {
-                    variant: "error",
-                    title: translate("error"),
-                    content: {
-                        message: translate("errors.404.flow or execution"),
+        ExecutionsAPI.followExecution(
+            {executionId},
+            {
+                signal: controller.signal,
+                /** No auto-reconnect: each reconnect leaked off-heap Netty buffers (kestra-io/kestra#16982). */
+                sseMaxRetryAttempts: 1,
+                onSseEvent: (event: { id?: string }) => {
+                    if (event.id === "end") receivedEnd = true
+                },
+                onSseError: () => finish(true),
+            },
+        )
+            .then(async ({stream}) => {
+                for await (const event of stream) {
+                    if (closed) break
+                    const executionEvent = event as unknown as Execution
+                    if (!executionEvent.state) continue
+                    handlers.onExecution(executionEvent)
+                }
+                finish(!receivedEnd)
+            })
+            .catch(() => finish(true))
+
+        return {close}
+    }
+
+    /** Keeps an execution the route guard already loaded, so the page does not fall back to its loading state. */
+    const followExecution = (options: { id: string }, translate: (itn: string) => string) => {
+        if (execution.value?.id !== options.id) {
+            execution.value = undefined
+        }
+        closeSSE()
+
+        executionSubscription.value = subscribeToExecution(options.id, {
+            onExecution: (parsedExecution) => throttledExecutionUpdate(parsedExecution),
+            /** The stream only fails with a 404, so no execution yet means not found, otherwise the connection was lost. */
+            onError: () => {
+                coreStore.message = !execution.value
+                    ? {
+                        variant: "error",
+                        title: translate("error"),
+                        content: translate("errors.404.flow or execution"),
                     }
-                };
-            } else {
-                coreStore.message = {
-                    variant: "error",
-                    title: translate("something_went_wrong.connection_lost.title"),
-                    content: {
-                        message: translate("something_went_wrong.connection_lost.message"),
+                    : {
+                        variant: "error",
+                        title: translate("something_went_wrong.connection_lost.title"),
+                        content: translate("something_went_wrong.connection_lost.message"),
                     }
-                };
-            }
-        }
-
-        return Promise.resolve(sse.value);
+            },
+            onEnd: () => {
+                throttledExecutionUpdate.flush()
+                closeSSE()
+            },
+        })
     }
 
     function followExecutionDependencies(options: { id: string; expandAll?: boolean }) {
-        return new EventSource(`${apiUrl()}/executions/${options.id}/follow-dependencies${options.expandAll ? "?expandAll=true" : ""}`, {withCredentials: true});
+        return new EventSource(`${apiUrl()}/executions/${options.id}/follow-dependencies${options.expandAll ? "?expandAll=true" : ""}`, {withCredentials: true})
     }
 
-    const followLogs = (options: { id: string }) => {
-        return Promise.resolve(new EventSource(`${apiUrl()}/logs/${options.id}/follow`, {withCredentials: true}));
+    const followLogs = (options: { id: string; params?: FilterQuery }) => {
+        const search = new URLSearchParams()
+        Object.entries(options.params ?? {}).forEach(([key, value]) => {
+            if (value === undefined || value === null || value === "") return
+            if (Array.isArray(value)) {
+                value.forEach(item => search.append(key, String(item)))
+            } else {
+                search.append(key, String(value))
+            }
+        })
+        const query = search.toString()
+        return Promise.resolve(new EventSource(`${apiUrl()}/logs/${options.id}/follow${query ? `?${query}` : ""}`, {withCredentials: true}))
     }
 
-    const loadLogs = (options: { executionId: string; params?: Record<string, any>; store?: boolean }) => {
-        return axios.get(`${apiUrl()}/logs/${options.executionId}`, {
-            params: options.params
-        }).then(response => {
+    const loadLogs = (options: { executionId: string; params?: FilterQuery; store?: boolean; showMessageOnError?: boolean }) => {
+        const requestOptions: KestraRequestOptions | undefined = options.showMessageOnError === false ? {showMessageOnError: false} : undefined
+        return LogsAPI.listLogsFromExecution(
+            {executionId: options.executionId, filters: routeQueryToQueryFilters(options.params ?? {})},
+            requestOptions,
+        ).then(data => {
             if (options.store === false) {
-                return response.data;
+                return data
             }
-            logs.value = response.data;
-            return response.data;
-        });
-    }
-
-    const loadMetrics = (options: { executionId: string; params?: Record<string, any>; store?: boolean }) => {
-        return axios.get(`${apiUrl()}/metrics/${options.executionId}`, {
-            params: options.params
-        }).then(response => {
-            if (options.store === false) {
-                return response.data;
-            }
-            metrics.value = response.data.results;
-            total.value = response.data.total;
-            return response.data;
-        });
-    }
-
-    const downloadLogs = (options: { executionId: string; params?: Record<string, any> }) => {
-        return axios.get(`${apiUrl()}/logs/${options.executionId}/download`, {
-            params: options.params
-        }).then(response => {
-            return response.data;
+            logs.value = data
+            return data
         })
     }
 
-    const deleteLogs = (options: { executionId: string; params?: Record<string, any> }) => {
-        return axios.delete(`${apiUrl()}/logs/${options.executionId}`, {
-            params: options.params
-        }).then(response => {
-            return response.data;
+    const downloadLogs = (options: { executionId: string; params?: FilterQuery }) => {
+        return LogsAPI.downloadLogsFromExecution({executionId: options.executionId, filters: routeQueryToQueryFilters(options.params ?? {})}) as unknown as Promise<string>
+    }
+
+    const downloadLogsFile = (options: { executionId: string; params?: FilterQuery }) => {
+        return downloadLogs(options).then(text => {
+            Utils.downloadUrl(
+                window.URL.createObjectURL(new Blob([text])),
+                executionLogsDownloadFilename(options.executionId, new Date()),
+            )
         })
     }
 
-    const _filePreview = ref<any | undefined>(undefined);
-    const filePreview = (options: { executionId: string } & Record<string, any>) => {
-        return axios.get(`${apiUrl()}/executions/${options.executionId}/file/preview`, {
-            params: options
-        }).then(response => {
-            let data = {...response.data};
-
-            // WORKAROUND, related to https://github.com/kestra-io/plugin-aws/issues/456
-            if (data.extension === "ion") {
-                const notObjects = data.content.some((e: any) => typeof e !== "object");
-
-                if (notObjects) {
-                    const content = data.content.length === 1 ? data.content[0] : data.content.join("\n");
-                    data = {...data, type: "TEXT", content};
-                }
-            }
-
-            _filePreview.value = data;
-            return data;
-        })
+    const deleteLogs = (options: { executionId: string; params?: { minLevel?: Level; taskRunId?: string; taskId?: string; attempt?: number } }) => {
+        return LogsAPI.deleteLogsFromExecution({executionId: options.executionId, ...options.params})
     }
 
-    const setLabels = (options: { executionId: string; labels: any }) => {
-        return axios.post(
-            `${apiUrl()}/executions/${options.executionId}/labels`,
-            options.labels,
-            {
-                headers: {
-                    "Content-Type": "application/json"
-                }
-            })
+    const filePreview = (options: { executionId: string; path: string; maxRows?: number; encoding?: string }) => {
+        return ExecutionsAPI.previewFileFromExecution(options).then(data => normalizeFilePreview({...data} as FilePreview))
     }
 
-    const querySetLabels = (options: { data: any; params: Record<string, any> }) => {
-        return axios.post(`${apiUrl()}/executions/labels/by-query`, options.data, {
-            params: options.params
-        })
+    /** The whole file as text, unlike `filePreview` which caps rows and bytes, so an HTML preview gets a valid document. */
+    const fileContent = (options: { executionId: string; path: string }): Promise<string> => {
+        return ExecutionsAPI.downloadFileFromExecution(options, {parseAs: "text"}) as unknown as Promise<string>
     }
 
-    const bulkSetLabels = (options: any) => {
-        return axios.post(`${apiUrl()}/executions/labels/by-ids`, options)
+    const setLabels = (options: { executionId: string; labels: Label[] }) => {
+        return ExecutionsAPI.setLabelsOnTerminatedExecution({executionId: options.executionId, body: options.labels})
+    }
+
+    const querySetLabels = (options: { data: Label[]; params: FilterQuery }) => {
+        return ExecutionsAPI.setLabelsOnTerminatedExecutionsByQuery({filters: routeQueryToQueryFilters(options.params), body: options.data})
+    }
+
+    const bulkSetLabels = (options: { executionsId: string[]; executionLabels: Label[] }) => {
+        return ExecutionsAPI.setLabelsOnTerminatedExecutionsByIds(options)
     }
 
     const unqueue = (options: { id: string; state: string }) => {
-        return axios.post(`${apiUrl()}/executions/${options.id}/unqueue?state=${options.state}`);
+        return ExecutionsAPI.unqueueExecution({executionId: options.id, state: options.state as Parameters<typeof ExecutionsAPI.unqueueExecution>[0]["state"]}) as unknown as Promise<Execution>
     }
 
-    const bulkUnqueueExecution = (options: { executionsId: string[]; newStatus: string }) => {
-        return axios.post(
-            `${apiUrl()}/executions/unqueue/by-ids?state=${options.newStatus}`,
-            options.executionsId
-        )
+    const bulkUnqueueExecution = (options: { executionsId: string[]; newStatus: StateType }) => {
+        return ExecutionsAPI.unqueueExecutionsByIds({body: options.executionsId, state: options.newStatus})
     }
 
-    const queryUnqueueExecution = (options: { newStatus: string } & Record<string, any>) => {
-        return axios.post(
-            `${apiUrl()}/executions/unqueue/by-query?state=${options.newStatus}`,
-            {},
-            {params: options}
-        )
+    const queryUnqueueExecution = (options: FilterQuery & { newStatus: StateType }) => {
+        return ExecutionsAPI.unqueueExecutionsByQuery({
+            filters: routeQueryToQueryFilters(options),
+            newState: options.newStatus,
+        })
     }
 
     const forceRun = (options: { id: string }) => {
-        return axios.post(`${apiUrl()}/executions/${options.id}/force-run`);
+        return ExecutionsAPI.forceRunExecution({executionId: options.id}) as unknown as Promise<Execution>
     }
 
     const bulkForceRunExecution = (options: { executionsId: string[] }) => {
-        return axios.post(
-            `${apiUrl()}/executions/force-run/by-ids`,
-            options.executionsId
-        )
+        return ExecutionsAPI.forceRunByIds({body: options.executionsId})
     }
 
-    const queryForceRunExecution = (options: Record<string, any>) => {
-        return axios.post(
-            `${apiUrl()}/executions/force-run/by-query`,
-            {},
-            {params: options}
-        )
+    const queryForceRunExecution = (options: FilterQuery) => {
+        return ExecutionsAPI.forceRunExecutionsByQuery({filters: routeQueryToQueryFilters(options)})
     }
 
     const loadFlowForExecution = (options: { namespace: string; flowId: string; revision?: number, store: boolean }) => {
-        const revision = options.revision ? `?revision=${options.revision}` : "";
-        return axios.get(`${apiUrl()}/executions/flows/${options.namespace}/${options.flowId}${revision}`)
-            .then(response => {
+        return ExecutionsAPI.flowFromExecution({namespace: options.namespace, flowId: options.flowId, revision: options.revision})
+            .then(data => {
                 if (options.store) {
-                    flow.value = response.data;
+                    flow.value = data
                 }
-                return response.data;
-            });
-    }
-
-    const loadFlowForExecutionByExecutionId = (options: { id: string, revision?: string }) => {
-        return axios.get(`${apiUrl()}/executions/${options.id}/flow`)
-            .then(response => {
-                flow.value = response.data;
-                return response.data;
-            });
-    }
-
-    const fetchGraph = (options: { id: string; params?: Record<string, any> }) => {
-        const params = options.params ? options.params : {};
-        return axios.get(`${apiUrl()}/executions/${options.id}/graph`, {params, withCredentials: true, paramsSerializer: {indexes: null}})
-            .then(response => {
-                return response.data;
+                return data
             })
     }
 
-    function loadGraph(options: { id: string; params?: Record<string, any> }) {
-        return fetchGraph(options).then(graph => {
-            // force refresh - Create a new object reference to trigger reactivity
-            flowGraph.value = Object.assign({}, graph);
-        });
+    const loadFlowForExecutionByExecutionId = (options: { id: string, revision?: string }) => {
+        return ExecutionsAPI.flowFromExecutionById({executionId: options.id})
+            .then(data => {
+                flow.value = data
+                return data
+            })
     }
 
-    function isUnused(nodeByUid: Record<string, any>, nodeUid: string): boolean {
-            const nodeToCheck = nodeByUid[nodeUid];
+    const fetchGraph = (options: GraphOptions): Promise<FlowGraph> => {
+        return ExecutionsAPI.executionFlowGraph({executionId: options.id, subflows: options.params?.subflows}, {withCredentials: true}) as unknown as Promise<FlowGraph>
+    }
 
-            if(!nodeToCheck) {
-                return false;
-            }
+    function loadGraph(options: GraphOptions) {
+        return fetchGraph(options).then(graph => {
+            flowGraph.value = Object.assign({}, graph)
+        })
+    }
 
-            if(!nodeToCheck.task) {
-                // check if parent is unused (current node is probably a cluster root or end)
-                const splitUid = nodeToCheck.uid.split(".");
-                splitUid.pop();
-                return isUnused(nodeByUid, splitUid.join("."));
-            }
+    function isUnused(nodeByUid: Record<string, FlowGraphNode>, nodeUid: string): boolean {
+        const nodeToCheck = nodeByUid[nodeUid]
 
-            if (!nodeToCheck.executionId) {
-                return true;
-            }
-
-            const nodeExecution = nodeToCheck.executionId === execution.value?.id ? execution.value
-                : Object.values(subflowsExecutions.value).filter(execution => execution.id === nodeToCheck.executionId)?.[0];
-
-            if (!nodeExecution) {
-                return true;
-            }
-
-            return !nodeExecution.taskRunList?.some((taskRun: { taskId: string }) => taskRun.taskId === nodeToCheck.task?.id);
-
-
+        if(!nodeToCheck) {
+            return false
         }
 
-    const loadAugmentedGraph = async (options: { id: string; params?: Record<string, any> }) => {
-        const params = options.params ? options.params : {};
-        const graph: {
-            nodes: any[];
-            edges: any[];
-            clusters?: any[];
-        } = await fetchGraph({id: options.id, params});
-        // Augment the graph with additional properties
+        if(!nodeToCheck.task) {
+            const splitUid = nodeToCheck.uid.split(".")
+            splitUid.pop()
+            return isUnused(nodeByUid, splitUid.join("."))
+        }
+
+        if (!nodeToCheck.executionId) {
+            return true
+        }
+
+        const nodeExecution = nodeToCheck.executionId === execution.value?.id ? execution.value
+            : Object.values(subflowsExecutions.value).filter(exec => exec.id === nodeToCheck.executionId)?.[0]
+
+        if (!nodeExecution) {
+            return true
+        }
+
+        return !nodeExecution.taskRunList?.some(taskRun => taskRun.taskId === nodeToCheck.task?.id)
+    }
+
+    /** Visits nodes shallowest first, so a parent is in `nodeByUid` before a child checks whether it is unused. */
+    const loadAugmentedGraph = async (options: GraphOptions) => {
+        const params = options.params ? options.params : {}
+        const graph = await fetchGraph({id: options.id, params})
 
         const subflowPaths = graph.clusters
             ?.map(c => c.cluster)
             ?.filter(cluster => cluster.type.endsWith("SubflowGraphCluster"))
             ?.map(cluster => cluster.uid.replace(CLUSTER_PREFIX, ""))
-            ?? [];
-        const nodeByUid: Record<string, any> = {};
+            ?? []
+        const nodeByUid: Record<string, FlowGraphNode> = {}
 
         graph.nodes
-            // lowest depth first to be available in nodeByUid map for child-to-parent unused check
             .sort((a, b) => a.uid.length - b.uid.length)
             .forEach(node => {
-                nodeByUid[node.uid] = node;
+                nodeByUid[node.uid] = node
 
                 const parentSubflow = subflowPaths.filter(subflowPath => node.uid.startsWith(subflowPath + "."))
                     .sort((a, b) => b.length - a.length)?.[0]
 
                 if(parentSubflow) {
                     if(parentSubflow in subflowsExecutions.value) {
-                        node.executionId = subflowsExecutions.value[parentSubflow]?.id;
+                        node.executionId = subflowsExecutions.value[parentSubflow]?.id
                     }
 
-                    return;
+                    return
                 }
 
-                node.executionId = options.id;
+                node.executionId = options.id
 
-                // reduce opacity for cluster root & end
                 if(!node.task && isUnused(nodeByUid, node.uid)) {
-                    node.unused = true;
+                    node.unused = true
                 }
-            });
+            })
 
         graph.edges
-            // keep only unused (or skipped) paths
             .filter(edge => {
-                return isUnused(nodeByUid, edge.target) || isUnused(nodeByUid, edge.source);
-            }).forEach(edge => edge.unused = true);
+                return isUnused(nodeByUid, edge.target) || isUnused(nodeByUid, edge.source)
+            }).forEach(edge => edge.unused = true)
 
-        // force refresh - Create a new object reference to trigger reactivity
-        flowGraph.value = Object.assign({}, graph);
+        flowGraph.value = Object.assign({}, graph)
 
-        return graph;
+        return graph
     }
 
     const loadNamespaces = () => {
-        return axios.get(`${apiUrl()}/executions/namespaces`)
-            .then(response => {
-                namespaces.value = response.data;
+        return ExecutionsAPI.listExecutableDistinctNamespaces()
+            .then(data => {
+                namespaces.value = data
             })
     }
 
     const loadFlowsExecutable = (options: { namespace: string }) => {
-        return axios.get(`${apiUrl()}/executions/namespaces/${options.namespace}/flows`)
-            .then(response => {
-                flowsExecutable.value = response.data;
+        return ExecutionsAPI.listFlowExecutionsByNamespace({namespace: options.namespace})
+            .then(data => {
+                flowsExecutable.value = data
             })
     }
 
-    const loadLatestExecutions = (options: { flowFilters: any }) => {
-        return axios.post(`${apiUrl()}/executions/latest`, options.flowFilters).then(response => {
-            return response.data;
-        })
+    const loadLatestExecutions = (options: { flowFilters: ExecutionRepositoryInterfaceFlowFilter[] }) => {
+        return ExecutionsAPI.latestExecutions({body: options.flowFilters})
     }
 
-    // mutations
-    const addSubflowExecution = (params: { subflow: string; execution: any }) => {
-        subflowsExecutions.value[params.subflow] = params.execution;
+    const addSubflowExecution = (params: { subflow: string; execution: Execution }) => {
+        subflowsExecutions.value[params.subflow] = params.execution
     }
 
     const removeSubflowExecution = (subflow: string) => {
-        delete subflowsExecutions.value[subflow];
+        delete subflowsExecutions.value[subflow]
+    }
+
+    /** Replaces the event with the same taskRunId and step, since a retry re-emits it, and reassigns
+     *  the array rather than mutating it so shallow watchers see the change. */
+    const addProgressEvent = (event: {taskId: string; taskRunId: string; step: string; timestamp: string}) => {
+        const existingIndex = progressEvents.value.findIndex(e => e.taskRunId === event.taskRunId && e.step === event.step)
+        if (existingIndex === -1) {
+            progressEvents.value = [...progressEvents.value, event]
+        } else {
+            progressEvents.value = progressEvents.value.map((e, i) => i === existingIndex ? event : e)
+        }
     }
 
     const resetLogs = () => {
-        logs.value = {results: [], total: 0};
+        logs.value = []
     }
 
-    const appendLogs = (logsData: { results: any[] }) => {
-        logs.value.results = logs.value.results.concat(logsData.results);
+    const appendLogs = (entries: LogEntry[]) => {
+        logs.value = logs.value.concat(entries)
     }
 
-    const appendFollowedLogs = (logsData: any) => {
-        logs.value.results.push(logsData);
-        logs.value.total = logs.value.results.length;
+    const appendFollowedLogs = (entry: LogEntry) => {
+        logs.value = [...logs.value, entry]
     }
 
     const getFlowExecutions = ({namespace, flowId}: { namespace: string; flowId: string }) => {
-        return axios.get(`${apiUrl()}/executions`, {
-            params: {
-                namespace,
-                flowId,
-            }
-        }).then(response => {
-            executions.value = response.data.results;
-            total.value = response.data.total;
-            return response.data;
-        });
+        return ExecutionsAPI.searchExecutionsByFlowId({namespace, flowId}).then(data => {
+            executions.value = data.results as unknown as Execution[]
+            total.value = data.total ?? 0
+            return data
+        })
     }
 
-    const exportExecutionsAsCSV = async (params: any) => {
-        const response = await axios.get(
-            `${apiUrl()}/executions/export/by-query/csv`,
-            {params, responseType: "blob"}
-        );
-        const url = window.URL.createObjectURL(new Blob([response.data]));
-        const link = document.createElement("a");
-        link.href = url;
-        link.setAttribute("download", "executions.csv");
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        window.URL.revokeObjectURL(url);
+    const exportExecutionsAsCSV = async (params: FilterQuery) => {
+        const data = await ExecutionsAPI.exportExecutions({filters: routeQueryToQueryFilters(params)}, {headers: {Accept: "text/csv"}, parseAs: "text"})
+        const url = window.URL.createObjectURL(new Blob([data as unknown as string]))
+        const link = document.createElement("a")
+        link.href = url
+        link.setAttribute("download", "executions.csv")
+        document.body.appendChild(link)
+        link.click()
+        link.remove()
+        window.URL.revokeObjectURL(url)
     }
 
     return {
-        // State
+        taskRunSelections,
         executions,
         execution,
-        taskRun,
         total,
         logs,
-        metrics,
-        metricsTotal,
         subflowsExecutions,
+        progressEvents,
         flow,
         flowGraph,
         namespaces,
         flowsExecutable,
-        // Actions
         restartExecution,
         bulkRestartExecution,
         queryRestartExecution,
@@ -778,30 +830,36 @@ export const useExecutionsStore = defineStore("executions", () => {
         replayExecutionWithInputs,
         changeExecutionStatus,
         changeStatus,
+        interrupt,
+        waitForStateChange,
         kill,
         bulkKill,
         queryKill,
         resume,
+        resumeFromBreakpoint,
         validateResume,
         pause,
         bulkPauseExecution,
         queryPauseExecution,
         loadExecution,
         findExecutions,
+        findDistinctFieldValues,
         validateExecution,
         triggerExecution,
         deleteExecution,
         bulkDeleteExecution,
         queryDeleteExecution,
         closeSSE,
+        subscribeToExecution,
         followExecution,
         followExecutionDependencies,
         followLogs,
         loadLogs,
-        loadMetrics,
         downloadLogs,
+        downloadLogsFile,
         deleteLogs,
         filePreview,
+        fileContent,
         setLabels,
         querySetLabels,
         bulkSetLabels,
@@ -820,10 +878,11 @@ export const useExecutionsStore = defineStore("executions", () => {
         loadLatestExecutions,
         addSubflowExecution,
         removeSubflowExecution,
+        addProgressEvent,
         resetLogs,
         appendLogs,
         appendFollowedLogs,
         getFlowExecutions,
-        exportExecutionsAsCSV
-    };
-});
+        exportExecutionsAsCSV,
+    }
+})

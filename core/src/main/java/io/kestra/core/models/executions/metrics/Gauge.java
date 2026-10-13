@@ -1,16 +1,19 @@
 package io.kestra.core.models.executions.metrics;
 
+import java.time.Instant;
+import java.util.Map;
+
 import com.fasterxml.jackson.annotation.JsonInclude;
+
+import io.kestra.core.metrics.MetricRegistry;
+import io.kestra.core.models.executions.AbstractMetricEntry;
+
 import jakarta.annotation.Nullable;
+import jakarta.validation.constraints.NotNull;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.ToString;
-import io.kestra.core.metrics.MetricRegistry;
-import io.kestra.core.models.executions.AbstractMetricEntry;
-
-import jakarta.validation.constraints.NotNull;
-import java.util.Map;
 
 @ToString
 @EqualsAndHashCode
@@ -33,12 +36,27 @@ public class Gauge extends AbstractMetricEntry<Double> {
         this.value = value;
     }
 
+    private Gauge(@NotNull String name, @Nullable String description, @NotNull Double value, @NotNull Instant timestamp, String... tags) {
+        super(name, description, tags);
+
+        this.value = value;
+        this.timestamp = timestamp;
+    }
+
     public static Gauge of(@NotNull String name, @NotNull Double value, String... tags) {
         return new Gauge(name, null, value, tags);
     }
 
     public static Gauge of(@NotNull String name, @Nullable String description, @NotNull Double value, String... tags) {
         return new Gauge(name, description, value, tags);
+    }
+
+    public static Gauge of(@NotNull String name, @NotNull Double value, @NotNull Instant timestamp, String... tags) {
+        return new Gauge(name, null, value, timestamp, tags);
+    }
+
+    public static Gauge of(@NotNull String name, @Nullable String description, @NotNull Double value, @NotNull Instant timestamp, String... tags) {
+        return new Gauge(name, description, value, timestamp, tags);
     }
 
     public static Gauge of(@NotNull String name, @NotNull Integer value, String... tags) {
@@ -68,7 +86,7 @@ public class Gauge extends AbstractMetricEntry<Double> {
     @Override
     public void register(MetricRegistry meterRegistry, String name, String description, Map<String, String> tags) {
         meterRegistry
-                .gauge(this.metricName(name), description, this.value, this.tagsAsArray(tags));
+            .gauge(this.metricName(name), description, this.value, this.tagsAsArray(tags));
     }
 
     @Override

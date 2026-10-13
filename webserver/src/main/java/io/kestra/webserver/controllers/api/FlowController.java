@@ -1,15 +1,27 @@
 package io.kestra.webserver.controllers.api;
 
+import java.io.IOException;
+import java.util.*;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import org.apache.commons.io.IOUtils;
+import org.reactivestreams.Publisher;
+
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
+
+import io.kestra.core.exceptions.FlowNotFoundException;
 import io.kestra.core.exceptions.FlowProcessingException;
 import io.kestra.core.exceptions.IllegalVariableEvaluationException;
 import io.kestra.core.exceptions.InternalException;
+import io.kestra.core.exceptions.InvalidException;
+import io.kestra.core.http.KestraMediaTypes;
 import io.kestra.core.models.HasSource;
 import io.kestra.core.models.QueryFilter;
-import io.kestra.core.models.SearchResult;
+import io.kestra.core.models.QueryFilter.Resource;
 import io.kestra.core.models.flows.*;
 import io.kestra.core.models.hierarchies.FlowGraph;
+import io.kestra.core.models.namespaces.NamespaceInterface;
 import io.kestra.core.models.tasks.Task;
 import io.kestra.core.models.topologies.FlowTopology;
 import io.kestra.core.models.topologies.FlowTopologyGraph;
@@ -17,24 +29,40 @@ import io.kestra.core.models.triggers.AbstractTrigger;
 import io.kestra.core.models.validations.ManualConstraintViolation;
 import io.kestra.core.models.validations.ModelValidator;
 import io.kestra.core.models.validations.ValidateConstraintViolation;
+import io.kestra.core.models.validations.ValidationError;
+import io.kestra.core.queues.QueueException;
 import io.kestra.core.repositories.FlowRepositoryInterface;
+import io.kestra.core.security.SecurityConfiguration;
 import io.kestra.core.serializers.JacksonMapper;
 import io.kestra.core.serializers.YamlParser;
+import io.kestra.core.services.ExpressionCategory;
+import io.kestra.core.services.ExpressionContext;
+import io.kestra.core.services.ExpressionContextService;
+import io.kestra.core.services.FlowParsingService;
 import io.kestra.core.services.FlowService;
 import io.kestra.core.services.GraphService;
-import io.kestra.core.services.PluginDefaultService;
 import io.kestra.core.tenant.TenantService;
 import io.kestra.core.topologies.FlowTopologyService;
-import io.kestra.core.utils.Rethrow;
 import io.kestra.webserver.controllers.domain.IdWithNamespace;
 import io.kestra.webserver.converters.QueryFilterFormat;
+import io.kestra.webserver.models.flows.SourceSearchReplaceApplyRequest;
+import io.kestra.webserver.models.flows.SourceSearchReplaceApplyResponse;
+import io.kestra.webserver.models.flows.SourceSearchReplaceLineRequest;
+import io.kestra.webserver.models.flows.SourceSearchReplacePreviewRequest;
+import io.kestra.webserver.models.flows.SourceSearchReplacePreviewResponse;
+import io.kestra.webserver.models.flows.SourceSearchResult;
 import io.kestra.webserver.responses.BulkResponse;
 import io.kestra.webserver.responses.PagedResults;
+import io.kestra.webserver.services.SourceSearchService;
 import io.kestra.webserver.utils.CSVUtils;
 import io.kestra.webserver.utils.PageableUtils;
-import io.kestra.webserver.utils.RequestUtils;
+import io.kestra.webserver.errors.ProblemDetail;
+import io.kestra.webserver.errors.ProblemError;
+import io.kestra.webserver.errors.ProblemType;
+import io.kestra.webserver.errors.ProblemTypes;
+import io.kestra.webserver.exceptions.BulkValidationException;
+
 import io.micronaut.core.annotation.Nullable;
-import io.micronaut.core.convert.format.Format;
 import io.micronaut.data.model.Pageable;
 import io.micronaut.http.*;
 import io.micronaut.http.annotation.*;
@@ -42,8 +70,6 @@ import io.micronaut.http.exceptions.HttpStatusException;
 import io.micronaut.http.multipart.CompletedFileUpload;
 import io.micronaut.scheduling.TaskExecutors;
 import io.micronaut.scheduling.annotation.ExecuteOn;
-import io.micronaut.validation.Validated;
-import io.swagger.v3.oas.annotations.Hidden;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.enums.ParameterIn;
@@ -55,29 +81,26 @@ import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import jakarta.inject.Inject;
 import jakarta.validation.ConstraintViolationException;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotEmpty;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
-import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
+import tools.jackson.databind.ObjectMapper;
 
-import java.io.IOException;
-import java.util.*;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
+import static io.kestra.core.utils.Rethrow.throwConsumer;
+import static io.kestra.core.utils.Rethrow.throwFunction;
 
-@Validated
 @Controller("/api/v1/{tenant}/flows")
 @Slf4j
 public class FlowController {
-    private static final String WARNING_JSON_FLOW_ENDPOINT = "This endpoint is deprecated. Handling flows as 'application/json' is no longer supported and will be removed in a future release. Please use the same endpoint with an 'application/x-yaml' content type.";
 
     @Inject
     private FlowRepositoryInterface flowRepository;
 
     @Inject
-    private PluginDefaultService pluginDefaultService;
+    private FlowParsingService flowParsingService;
 
     @Inject
     private ModelValidator modelValidator;
@@ -97,11 +120,19 @@ public class FlowController {
     @Inject
     private ObjectMapper objectMapper;
 
+    @Inject
+    private ExpressionContextService expressionContextService;
+
+    @Inject
+    private SecurityConfiguration securityConfiguration;
+
+    @Inject
+    private SourceSearchService sourceSearchService;
 
     @ExecuteOn(TaskExecutors.IO)
     @Get(uri = "{namespace}/{id}/graph")
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Generate a graph for a flow",
         responses = {
             @ApiResponse(
@@ -114,15 +145,12 @@ public class FlowController {
         @Parameter(description = "The flow namespace") @PathVariable String namespace,
         @Parameter(description = "The flow id") @PathVariable String id,
         @Parameter(description = "The flow revision") @QueryValue Optional<Integer> revision,
-        @Parameter(description = "The subflow tasks to display") @Nullable @QueryValue List<String> subflows
-    ) throws IllegalVariableEvaluationException, FlowProcessingException {
+        @Parameter(description = "The subflow tasks to display") @Nullable @QueryValue List<String> subflows) throws IllegalVariableEvaluationException, FlowProcessingException {
         FlowWithSource flow = flowRepository
             .findByIdWithSource(tenantService.resolveTenant(), namespace, id, revision)
             .orElse(null);
 
-        String flowUid = revision.isEmpty() ?
-            FlowId.uidWithoutRevision(tenantService.resolveTenant(), namespace, id) :
-            FlowId.uid(tenantService.resolveTenant(), namespace, id, revision);
+        String flowUid = revision.isEmpty() ? FlowId.uidWithoutRevision(tenantService.resolveTenant(), namespace, id) : FlowId.uid(tenantService.resolveTenant(), namespace, id, revision);
         if (flow == null) {
             throw new NoSuchElementException(
                 "Unable to find flow " + flowUid
@@ -130,9 +158,10 @@ public class FlowController {
         }
 
         if (flow instanceof FlowWithException fwe) {
-            throw new IllegalStateException(
-                "Unable to generate graph for flow " + flowUid +
-                " because of exception " + fwe.getException()
+            throw new InvalidException(
+                fwe,
+                "Cannot generate a graph for flow '%s': the flow itself is invalid. Cause: %s"
+                    .formatted(flowUid, fwe.getException())
             );
         }
 
@@ -148,14 +177,15 @@ public class FlowController {
     }
 
     @ExecuteOn(TaskExecutors.IO)
-    @Post(uri = "graph", consumes = MediaType.APPLICATION_YAML)
-    @Operation(tags = {"Flows"}, summary = "Generate a graph for a flow source")
+    @Post(uri = "graph", consumes = { KestraMediaTypes.APPLICATION_X_YAML, MediaType.APPLICATION_YAML })
+    @Operation(tags = { "Flows" }, summary = "Generate a graph for a flow source")
     public FlowGraph generateFlowGraphFromSource(
         @RequestBody(description = "The flow source code") @Body String flow,
-        @Parameter(description = "The subflow tasks to display") @Nullable @QueryValue List<String> subflows
-    ) throws ConstraintViolationException, IllegalVariableEvaluationException, FlowProcessingException {
+        @Parameter(description = "The subflow tasks to display") @Nullable @QueryValue List<String> subflows)
+        throws ConstraintViolationException, IllegalVariableEvaluationException, FlowProcessingException {
         try {
-            FlowWithSource flowParsed = pluginDefaultService.parseFlowWithAllDefaults(tenantService.resolveTenant(), flow, false);
+            FlowWithSource flowParsed = flowParsingService.parse(tenantService.resolveTenant(), flow, false);
+            modelValidator.validate(flowParsingService.parseForValidation(flowParsed));
             return graphService.flowGraph(flowParsed, subflows);
         } catch (FlowProcessingException e) {
             if (e.getCause() instanceof ConstraintViolationException cve) {
@@ -169,50 +199,47 @@ public class FlowController {
 
     @ExecuteOn(TaskExecutors.IO)
     @Get(uri = "{namespace}/{id}")
-    @Operation(tags = {"Flows"}, summary = "Get a flow")
-    @ApiResponse(responseCode = "200", description = "On success", content = {@Content(schema = @Schema(implementation = FlowWithSource.class))})
+    @Operation(tags = { "Flows" }, summary = "Get a flow")
+    @ApiResponse(responseCode = "200", description = "On success", content = { @Content(schema = @Schema(implementation = FlowWithSource.class)) })
     //FIXME we return Object instead of Flow as Micronaut, since 4, has an issue with subtypes serialization, see https://github.com/micronaut-projects/micronaut-core/issues/10294.
     public Object getFlow(
         @Parameter(description = "The flow namespace") @PathVariable String namespace,
         @Parameter(description = "The flow id") @PathVariable String id,
         @Parameter(description = "Include the source code") @QueryValue(defaultValue = "false") boolean source,
         @Parameter(description = "Get latest revision by default") @Nullable @QueryValue Integer revision,
-        @Parameter(description = "Get flow even if deleted") @QueryValue(defaultValue = "false") boolean allowDeleted
-    ) {
-        return source ?
-            flowRepository
-                .findByIdWithSource(tenantService.resolveTenant(), namespace, id, Optional.ofNullable(revision), allowDeleted)
-                .orElse(null) :
-            flowRepository
+        @Parameter(description = "Get flow even if deleted") @QueryValue(defaultValue = "false") boolean allowDeleted) {
+        return source ? flowRepository
+            .findByIdWithSource(tenantService.resolveTenant(), namespace, id, Optional.ofNullable(revision), allowDeleted)
+            .orElse(null)
+            : flowRepository
                 .findById(tenantService.resolveTenant(), namespace, id, Optional.ofNullable(revision), allowDeleted)
                 .orElse(null);
     }
 
     @ExecuteOn(TaskExecutors.IO)
     @Get(uri = "{namespace}/{id}/revisions")
-    @Operation(tags = {"Flows"}, summary = "Get revisions for a flow")
+    @Operation(tags = { "Flows" }, summary = "Get revisions for a flow")
     public List<FlowWithSource> listFlowRevisions(
         @Parameter(description = "The flow namespace") @PathVariable String namespace,
         @Parameter(description = "The flow id") @PathVariable String id,
-        @QueryValue(defaultValue = "false") Boolean allowDelete
-    ) {
+        @QueryValue(defaultValue = "false") Boolean allowDelete) {
         return flowRepository.findRevisions(tenantService.resolveTenant(), namespace, id, allowDelete);
     }
 
     @ExecuteOn(TaskExecutors.IO)
     @Get(uri = "{namespace}/{id}/tasks/{taskId}")
-    @Operation(tags = {"Flows"}, summary = "Get a flow task")
+    @Operation(tags = { "Flows" }, summary = "Get a flow task")
     //FIXME we return Object instead of Task as Micronaut, since 4, has an issue with subtypes serialization, see https://github.com/micronaut-projects/micronaut-core/issues/10294.
     @Schema(implementation = Task.class)
     public Object getTaskFromFlow(
         @Parameter(description = "The flow namespace") @PathVariable String namespace,
         @Parameter(description = "The flow id") @PathVariable String id,
         @Parameter(description = "The task id") @PathVariable String taskId,
-        @Parameter(description = "The flow revision") @Nullable @QueryValue Integer revision
-    ) {
+        @Parameter(description = "The flow revision") @Nullable @QueryValue Integer revision) {
         return flowRepository
             .findById(tenantService.resolveTenant(), namespace, id, Optional.ofNullable(revision))
-            .flatMap(flow -> {
+            .flatMap(flow ->
+            {
                 try {
                     return Optional.of(flow.findTaskByTaskId(taskId));
                 } catch (InternalException e) {
@@ -224,84 +251,176 @@ public class FlowController {
 
     @ExecuteOn(TaskExecutors.IO)
     @Get(uri = "/search")
-    @Operation(tags = {"Flows"}, summary = "Search for flows")
+    @Operation(tags = { "Flows" }, summary = "Search for flows")
     public PagedResults<Flow> searchFlows(
         @Parameter(description = "The current page") @QueryValue(defaultValue = "1") @Min(1) int page,
-        @Parameter(description = "The current page size") @QueryValue(defaultValue = "10") @Min(1) int size,
-        @Parameter(description = "The sort of current page", examples = {
-            @ExampleObject(name = "Sort by namespace in ascending order", value = "namespace:asc"),
-            @ExampleObject(name = "Sort by flow ID in descending order", value = "id:desc"),
-        }) @Nullable @QueryValue List<String> sort,
-        @Parameter(description = "Filters. PHP-style nested query is used - examples: `filters[labels][NOT_EQUALS][foo]=bar`, `filters[namespace][CONTAINS]=test`", in = ParameterIn.QUERY) @QueryFilterFormat List<QueryFilter> filters,
-
-        @Deprecated @Parameter(description = "A string filter", deprecated = true) @Nullable @QueryValue(value = "q") String query,
-        @Deprecated @Parameter(description = "The scope of the flows to include", deprecated = true) @Nullable @QueryValue List<FlowScope> scope,
-        @Deprecated @Parameter(description = "A namespace filter prefix", deprecated = true) @Nullable @QueryValue String namespace,
-        @Deprecated @Parameter(description = "A labels filter as a list of 'key:value'", deprecated = true) @Nullable @QueryValue @Format("MULTI") List<String> labels
-
-    ) throws HttpStatusException {
-        filters = mapLegacyQueryParamsToNewFilters(filters, query, scope, namespace, labels);
-
-        return PagedResults.of(flowRepository.find(
-            PageableUtils.from(page, size, sort),
-            tenantService.resolveTenant(),
-            filters
-        ));
+        @Parameter(description = "The current page size") @QueryValue(defaultValue = "10") @Min(1) @Max(PageableUtils.MAX_PAGE_SIZE) int size,
+        @Parameter(
+            description = "The sort of current page", examples = {
+                @ExampleObject(name = "Sort by namespace in ascending order", value = "namespace:asc"),
+                @ExampleObject(name = "Sort by flow ID in descending order", value = "id:desc"),
+            }
+        ) @Nullable @QueryValue List<String> sort,
+        @Parameter(description = "Filters. PHP-style nested query is used - examples: `filters[labels][NOT_EQUALS][foo]=bar`, `filters[namespace][CONTAINS]=test`", in = ParameterIn.QUERY)
+        @QueryFilterFormat(Resource.FLOW) List<QueryFilter> filters) throws HttpStatusException {
+        return PagedResults.of(
+            flowRepository.find(
+                PageableUtils.from(page, size, sort),
+                tenantService.resolveTenant(),
+                filters
+            )
+        );
     }
-
 
     @ExecuteOn(TaskExecutors.IO)
     @Get(uri = "/{namespace}")
-    @Operation(tags = {"Flows"}, summary = "Retrieve all flows from a given namespace")
+    @Operation(tags = { "Flows" }, summary = "Retrieve all flows from a given namespace")
     public List<Flow> listFlowsByNamespace(
-        @Parameter(description = "Namespace to filter flows") @PathVariable String namespace
-    ) throws HttpStatusException {
+        @Parameter(description = "Namespace to filter flows") @PathVariable String namespace) throws HttpStatusException {
         return flowRepository.findByNamespace(tenantService.resolveTenant(), namespace);
     }
 
     @ExecuteOn(TaskExecutors.IO)
     @Get(uri = "/source")
-    @Operation(tags = {"Flows"}, summary = "Search for flows source code")
-    public PagedResults<SearchResult<Flow>> searchFlowsBySourceCode(
+    @Operation(tags = { "Flows" }, summary = "Search for flows source code")
+    public PagedResults<SourceSearchResult> searchFlowsBySourceCode(
         @Parameter(description = "The current page") @QueryValue(defaultValue = "1") @Min(1) int page,
-        @Parameter(description = "The current page size") @QueryValue(defaultValue = "10") @Min(1) int size,
+        @Parameter(description = "The current page size") @QueryValue(defaultValue = "10") @Min(1) @Max(PageableUtils.MAX_PAGE_SIZE) int size,
         @Parameter(description = "The sort of current page") @Nullable @QueryValue List<String> sort,
         @Parameter(description = "A string filter") @Nullable @QueryValue(value = "q") String query,
-        @Parameter(description = "A namespace filter prefix") @Nullable @QueryValue String namespace
-    ) throws HttpStatusException {
-        return PagedResults.of(flowRepository.findSourceCode(PageableUtils.from(page, size, sort), query, tenantService.resolveTenant(), namespace));
+        @Parameter(description = "A namespace filter prefix") @Nullable @QueryValue String namespace,
+        @Parameter(description = "Whether the query must match with exact case") @QueryValue(defaultValue = "false") boolean caseSensitive,
+        @Parameter(description = "Whether the query must match on word boundaries only") @QueryValue(defaultValue = "false") boolean wholeWord,
+        @Parameter(description = "Whether the query is a regular expression rather than a literal string") @QueryValue(defaultValue = "false") boolean regex,
+        @Parameter(description = "Restricts matches to a top-level section of the flow YAML") @QueryValue(defaultValue = "all") SourceSearchScope scope) throws HttpStatusException {
+        return PagedResults.of(
+            sourceSearchService.search(
+                PageableUtils.from(page, size, sort),
+                tenantService.resolveTenant(),
+                namespace,
+                query,
+                caseSensitive,
+                wholeWord,
+                regex,
+                scope
+            )
+        );
     }
 
+    @ExecuteOn(TaskExecutors.IO)
+    @Post(uri = "/source/replace/preview")
+    @Operation(
+        tags = { "Flows" }, summary = "Preview a Source Search replace-all operation",
+        description = "Computes the matched lines and their proposed replacement for every matching flow, without persisting anything."
+    )
+    public SourceSearchReplacePreviewResponse previewReplaceBySourceCode(
+        @RequestBody(description = "The search query and replacement") @Body @Valid SourceSearchReplacePreviewRequest request) {
+        return sourceSearchService.preview(
+            tenantService.resolveTenant(),
+            request.namespace(),
+            request.query(),
+            request.caseSensitive(),
+            request.wholeWord(),
+            request.regex(),
+            request.scopeOrAll(),
+            request.replacement()
+        );
+    }
 
     @ExecuteOn(TaskExecutors.IO)
-    @Post(consumes = MediaType.APPLICATION_YAML)
-    @Operation(tags = {"Flows"}, summary = "Create a flow from yaml source")
+    @Post(uri = "/source/replace/apply")
+    @Operation(
+        tags = { "Flows" }, summary = "Apply a Source Search replace-all operation",
+        description = "Replaces every match in the given flows and persists the new revisions. Flows the caller is not allowed to edit are skipped."
+    )
+    public SourceSearchReplaceApplyResponse applyReplaceBySourceCode(
+        @RequestBody(description = "The search query, replacement and target flows") @Body @Valid SourceSearchReplaceApplyRequest request) throws QueueException {
+        return sourceSearchService.apply(
+            tenantService.resolveTenant(),
+            request.query(),
+            request.caseSensitive(),
+            request.wholeWord(),
+            request.regex(),
+            request.scopeOrAll(),
+            request.replacement(),
+            request.flows()
+        );
+    }
+
+    @ExecuteOn(TaskExecutors.IO)
+    @Post(uri = "/source/replace/line")
+    @Operation(
+        tags = { "Flows" }, summary = "Apply a Source Search replace on a single match line",
+        description = "Replaces the matches on one line of one flow and persists the new revision. Returns the flow as skipped if it is not editable or fails validation."
+    )
+    public SourceSearchReplaceApplyResponse replaceLineBySourceCode(
+        @RequestBody(description = "The search query, replacement and target match line") @Body @Valid SourceSearchReplaceLineRequest request) throws QueueException {
+        return sourceSearchService.applyLine(
+            tenantService.resolveTenant(),
+            request.query(),
+            request.caseSensitive(),
+            request.wholeWord(),
+            request.regex(),
+            request.replacement(),
+            request.namespace(),
+            request.id(),
+            request.line(),
+            request.column()
+        );
+    }
+
+    @ExecuteOn(TaskExecutors.IO)
+    @Post(consumes = { KestraMediaTypes.APPLICATION_X_YAML, MediaType.APPLICATION_YAML })
+    @Operation(tags = { "Flows" }, summary = "Create a flow from yaml source")
     public HttpResponse<FlowWithSource> createFlow(
-        @RequestBody(description = "The flow source code") @Body String flow
-    ) throws ConstraintViolationException {
-        return HttpResponse.ok(doCreate(parseFlowSource(flow)));
+        @RequestBody(description = "The flow source code") @Body String flow,
+        @Parameter(description = "Save the flow as a draft. Drafts are not picked up by webhooks, schedules or subflows and are not validated for constraint violations.")
+        @QueryValue(defaultValue = "false") boolean draft) throws ConstraintViolationException {
+        final String tenantId = tenantService.resolveTenant();
+
+        // Draft is metadata about the revision, not part of the YAML body, so it comes from the
+        // request parameter (similar to how `revision` is excluded). A draft may be saved with a
+        // constraint-invalid body (unknown properties, missing tasks, ...): we fall back to reading
+        // the identity from the raw source. Unlike updateFlow, the create path has no path variables,
+        // so the body must still be parseable enough to extract `namespace` and `id` - a flow cannot
+        // be persisted without them, so a syntactically unparsable create is still rejected.
+        GenericFlow genericFlow;
+        try {
+            genericFlow = parseFlowSource(flow).toBuilder().draft(draft).build();
+        } catch (ConstraintViolationException e) {
+            if (!draft) {
+                throw e;
+            }
+            Map<String, Object> raw = YamlParser.parse(flow, Map.class, false);
+            genericFlow = draftFromSource(
+                tenantId,
+                Objects.toString(raw.get("namespace"), null),
+                Objects.toString(raw.get("id"), null),
+                flow
+            );
+        }
+        return HttpResponse.ok(doCreate(genericFlow));
     }
 
     /**
-     * @deprecated use {@link #createFlow(String)} (String)} instead
+     * Builds a draft {@link GenericFlow} from a source that failed constraint validation, keeping
+     * the provided identity. Drafts are deliberately allowed to be invalid since the backend is
+     * the authoritative validator.
      */
-    @ExecuteOn(TaskExecutors.IO)
-    @Post(consumes = MediaType.ALL)
-    @Operation(tags = {"Flows"}, summary = "Create a flow from json object", deprecated = true, hidden = true)
-    @Deprecated(forRemoval = true, since = "0.18")
-    @Hidden // we hide it otherwise this is the one that will be included in the OpenAPI spec instead of the YAML one.
-    public HttpResponse<Flow> createFlowFromJson(
-        @RequestBody(description = "The flow") @Body Flow flow
-    ) throws ConstraintViolationException {
-        log.warn(WARNING_JSON_FLOW_ENDPOINT);
-
-        return HttpResponse.ok(doCreate(parseFlowSource(flow.sourceOrGenerateIfNull())).toFlow());
+    private static GenericFlow draftFromSource(final String tenantId, final String namespace, final String id, final String source) {
+        return GenericFlow.builder()
+            .tenantId(tenantId)
+            .namespace(namespace)
+            .id(id)
+            .source(source)
+            .draft(true)
+            .build();
     }
 
     @SneakyThrows
     protected FlowWithSource doCreate(final GenericFlow flow) {
         try {
-            return flowService.create(flow, true);
+            return flowService.create(flow);
         } catch (FlowProcessingException e) {
             if (e.getCause() instanceof ConstraintViolationException cve) {
                 throw cve;
@@ -312,24 +431,18 @@ public class FlowController {
     }
 
     @ExecuteOn(TaskExecutors.IO)
-    @Post(uri = "{namespace}", consumes = MediaType.APPLICATION_YAML)
+    @Post(uri = "{namespace}", consumes = { KestraMediaTypes.APPLICATION_X_YAML, MediaType.APPLICATION_YAML })
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Update a complete namespace from yaml source",
         description = "All flow will be created / updated for this namespace.\n" +
-                      "Flow that already created but not in `flows` will be deleted if the query delete is `true`"
+            "Flow that already created but not in `flows` will be deleted if the query delete is `true`"
     )
     public List<FlowInterface> updateFlowsInNamespace(
         @Parameter(description = "The flow namespace") @PathVariable String namespace,
         @RequestBody(description = "A list of flows source code") @Body @Nullable String flows,
-        @Parameter(description = "If missing flow should be deleted") @QueryValue(defaultValue = "true") Boolean delete
-    ) throws ConstraintViolationException {
-        List<String> sources = flows != null ? List.of(flows.split("---")) : new ArrayList<>();
-
-        List<GenericFlow> genericFlows = sources
-            .stream()
-            .map(source -> parseFlowSource(source.trim()))
-            .toList();
+        @Parameter(description = "If missing flow should be deleted") @QueryValue(defaultValue = "true") Boolean delete) throws Exception {
+        List<GenericFlow> genericFlows = parseMultiFlowSource(flows);
 
         return this.bulkUpdateOrCreate(namespace, genericFlows, delete, false);
     }
@@ -337,7 +450,7 @@ public class FlowController {
     @ExecuteOn(TaskExecutors.IO)
     @Post(uri = "{namespace}", consumes = MediaType.MULTIPART_FORM_DATA)
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Update a complete namespace from yaml source",
         description = "All flows will be created / updated for this namespace.\n" +
             "Existing flows missing from `flows` will be deleted if the query delete is `true`"
@@ -346,8 +459,7 @@ public class FlowController {
         @Parameter(description = "The flow namespace") @PathVariable String namespace,
         @RequestBody(description = "A list of flow files") @Part("flows") Publisher<CompletedFileUpload> flowsPublisher,
         @Parameter(description = "If namespace of all provided flows should be overridden") @QueryValue(defaultValue = "false") Boolean override,
-        @Parameter(description = "If missing flows should be deleted") @QueryValue(defaultValue = "true") Boolean delete
-    ) throws ConstraintViolationException, IOException {
+        @Parameter(description = "If missing flows should be deleted") @QueryValue(defaultValue = "true") Boolean delete) throws Exception {
         List<CompletedFileUpload> flowFiles = Flux.from(flowsPublisher)
             .collectList()
             .blockOptional()
@@ -366,93 +478,16 @@ public class FlowController {
         return this.bulkUpdateOrCreate(namespace, genericFlows, delete, false);
     }
 
-    /**
-     * @deprecated use {@link #updateFlowsInNamespace(String, String, Boolean)} instead
-     */
-    @ExecuteOn(TaskExecutors.IO)
-    @Post(uri = "{namespace}")
-    @Operation(
-        tags = {"Flows"},
-        summary = "Update a complete namespace from json object",
-        description = "All flow will be created / updated for this namespace.\n" +
-                      "Flow that already created but not in `flows` will be deleted if the query delete is `true`",
-        deprecated = true,
-        hidden = true
-    )
-    @Deprecated(forRemoval = true, since = "0.18")
-    @Hidden // we hide it otherwise this is the one that will be included in the OpenAPI spec instead of the YAML one.
-    public List<Flow> updateFlowsInNamespaceFromJson(
-        @Parameter(description = "The flow namespace") @PathVariable String namespace,
-        @RequestBody(description = "A list of flows") @Body @Valid List<Flow> flows,
-        @Parameter(description = "If missing flow should be deleted") @QueryValue(defaultValue = "true") Boolean delete
-    ) throws ConstraintViolationException, FlowProcessingException {
-        log.warn(WARNING_JSON_FLOW_ENDPOINT);
+    protected List<FlowInterface> bulkUpdateOrCreate(@Nullable String namespace, List<GenericFlow> flows, Boolean delete, Boolean allowNamespaceChild) throws Exception {
 
-        List<GenericFlow> genericFlows = flows.stream()
-            .map(flow -> parseFlowSource(flow.sourceOrGenerateIfNull())).toList();
-
-        return this.bulkUpdateOrCreate(namespace, genericFlows, delete, false).stream()
-            .map(Rethrow.throwFunction(flow -> {
-                try {
-                    return pluginDefaultService.injectVersionDefaults(flow, false).toFlow();
-                } catch (FlowProcessingException e) {
-                    if (e.getCause() instanceof ConstraintViolationException cve) {
-                        throw cve;
-                    } else {
-                        throw e;
-                    }
-                }
-            }))
-            .toList();
-    }
-
-    protected List<FlowInterface> bulkUpdateOrCreate(@Nullable String namespace, List<GenericFlow> flows, Boolean delete, Boolean allowNamespaceChild) {
-
-        if (namespace != null) {
-            // control namespace to update
-            Set<ManualConstraintViolation<GenericFlow>> invalids = flows
-                .stream()
-                .filter(flow ->
-                    !flow.getNamespace().equals(namespace) && (!flow.getNamespace().startsWith(namespace) || !allowNamespaceChild))
-                .map(flow -> ManualConstraintViolation.of(
-                    String.format("%s - flow namespace is invalid", flow.uid()),
-                    flow,
-                    GenericFlow.class,
-                    "flow.namespace",
-                    flow.getNamespace()
-                ))
-                .collect(Collectors.toSet());
-
-            if (!invalids.isEmpty()) {
-                throw new ConstraintViolationException(invalids);
-            }
-        }
-
-        // multiple same flows
-        List<String> duplicate = flows
+        // list all uids of updated flows
+        Set<String> uids = flows
             .stream()
-            .map(GenericFlow::getId)
-            .distinct()
-            .toList();
+            .map(FlowId::uidWithoutRevision)
+            .collect(Collectors.toSet());
 
-        if (duplicate.size() < flows.size()) {
-            throw new ConstraintViolationException(Collections.singleton(ManualConstraintViolation.of(
-                "Duplicate flow id",
-                flows,
-                List.class,
-                "flow.id",
-                duplicate
-            )));
-        }
-
-        // list all ids of updated flows
-        List<String> ids = flows
-            .stream()
-            .map(GenericFlow::getId)
-            .toList();
-
-        // delete all not in updated ids
-        List<? extends FlowInterface> deleted = new ArrayList<>();
+        // delete all not in updated uids
+        List<FlowWithSource> deleted = new ArrayList<>();
         if (delete) {
             if (namespace != null) {
                 deleted = flowRepository
@@ -462,51 +497,101 @@ public class FlowController {
                     .findAllWithSource(tenantService.resolveTenant());
             }
             deleted = deleted.stream()
-                .filter(flow -> !ids.contains(flow.getId()))
-                .peek(flow -> flowRepository.delete(flow))
+                .filter(flow -> !uids.contains(FlowId.uidWithoutRevision(flow)))
                 .toList();
         }
 
+        validateBulkUpdate(flows, deleted);
+
+        if (namespace != null) {
+            // control namespace to update
+            Set<ManualConstraintViolation<GenericFlow>> invalids = flows
+                .stream()
+                .filter(
+                    flow -> flow.getNamespace() == null
+                        || (!flow.getNamespace().equals(namespace) && (!NamespaceInterface.isDescendantOrSelf(namespace, flow.getNamespace()) || !allowNamespaceChild))
+                )
+                .map(
+                    flow -> ManualConstraintViolation.of(
+                        flow.getNamespace() == null
+                            ? String.format("%s - flow namespace is required", flow.getId())
+                            : String.format("%s - flow namespace is invalid", flow.uid()),
+                        flow,
+                        GenericFlow.class,
+                        "flow.namespace",
+                        flow.getNamespace()
+                    )
+                )
+                .collect(Collectors.toSet());
+
+            if (!invalids.isEmpty()) {
+                throw new ConstraintViolationException(invalids);
+            }
+        }
+
+        // multiple same flows
+        if (uids.size() < flows.size()) {
+            throw new ConstraintViolationException(
+                Collections.singleton(
+                    ManualConstraintViolation.of(
+                        "Duplicate flow id",
+                        flows,
+                        List.class,
+                        "flow.id",
+                        List.copyOf(uids)
+                    )
+                )
+            );
+        }
+
+        deleted.forEach(flowService::delete);
+
         // update or create flows
         List<? extends FlowInterface> updatedOrCreated = flows.stream()
-            .map(flow ->
-                flowRepository.findById(tenantService.resolveTenant(), flow.getNamespace(), flow.getId())
-                    .map(existing -> flowRepository.update(flow, existing))
-                    .orElseGet(() -> this.doCreate(flow))
+            .map(
+                throwFunction(
+                    flow -> flowRepository.findById(tenantService.resolveTenant(), flow.getNamespace(), flow.getId())
+                        .map(throwFunction(existing -> this.doUpdateFlow(flow, existing)))
+                        .orElseGet(() -> this.doCreate(flow))
+                )
             )
             .toList();
         return Stream.concat(deleted.stream(), updatedOrCreated.stream()).toList();
     }
 
-    @Put(uri = "{namespace}/{id}", consumes = MediaType.APPLICATION_YAML)
+    @Put(uri = "{namespace}/{id}", consumes = { KestraMediaTypes.APPLICATION_X_YAML, MediaType.APPLICATION_YAML })
     @ExecuteOn(TaskExecutors.IO)
-    @Operation(tags = {"Flows"}, summary = "Update a flow")// force deprecated = false otherwise it is marked as deprecated, dont know why
-    @ApiResponse(responseCode = "200", description = "On success", content = {@Content(schema = @Schema(implementation = FlowWithSource.class))})
+    @Operation(tags = { "Flows" }, summary = "Update a flow") // force deprecated = false otherwise it is marked as deprecated, dont know why
+    @ApiResponse(responseCode = "200", description = "On success", content = { @Content(schema = @Schema(implementation = FlowWithSource.class)) })
     public HttpResponse<FlowWithSource> updateFlow(
         @Parameter(description = "The flow namespace") @PathVariable String namespace,
         @Parameter(description = "The flow id") @PathVariable String id,
-        @RequestBody(description = "The flow source code") @Body String source
-    ) throws ConstraintViolationException, FlowProcessingException {
+        @RequestBody(description = "The flow source code") @Body String source,
+        @Parameter(description = "Save the flow as a draft. Drafts are not picked up by webhooks, schedules or subflows and are not validated for constraint violations.")
+        @QueryValue(defaultValue = "false") boolean draft) throws ConstraintViolationException, FlowProcessingException, QueueException {
         final String tenantId = tenantService.resolveTenant();
         Optional<Flow> existingFlow = flowRepository.findById(tenantId, namespace, id);
 
         if (existingFlow.isEmpty()) {
-            return HttpResponse.status(HttpStatus.NOT_FOUND);
+            throw new FlowNotFoundException(namespace, id);
         }
 
-        // Parse source as RawFlow.
-        GenericFlow genericFlow = GenericFlow.fromYaml(tenantId, source);
-
-        // Validate Subflows.
-
-        // Inject default plugin 'version' props before converting
-        // to flow to correctly resolve to plugin type.
+        // Parse source as RawFlow. Draft is metadata about the revision, not part of the YAML
+        // the user wrote (similar to how `revision` is excluded), so it comes from the request
+        // parameter rather than from the YAML body.
+        // For draft saves, tolerate unparsable YAML by falling back to the path-variable identity.
+        GenericFlow genericFlow;
         try {
-            FlowWithSource flow = pluginDefaultService.injectVersionDefaults(genericFlow, false);
-            flowService.checkValidSubflows(flow, tenantId);
+            genericFlow = GenericFlow.fromYaml(tenantId, source).toBuilder().draft(draft).build();
+        } catch (ConstraintViolationException e) {
+            if (!draft) {
+                throw e;
+            }
+            genericFlow = draftFromSource(tenantId, namespace, id, source);
+        }
 
-            // Persist
-            return HttpResponse.ok(updateFlow(genericFlow, existingFlow.get()));
+        try {
+            return HttpResponse.ok(doUpdateFlow(genericFlow, existingFlow.get()));
         } catch (FlowProcessingException e) {
             if (e.getCause() instanceof ConstraintViolationException cve) {
                 throw cve;
@@ -516,104 +601,43 @@ public class FlowController {
         }
     }
 
+    protected FlowWithSource doUpdateFlow(GenericFlow current, FlowInterface previous) throws FlowProcessingException, QueueException {
+        return flowService.update(current, previous);
+    }
+
     /**
-     * @deprecated use {@link #updateFlow(String, String, String)} instead
+     * Called once by a bulk update with the flows to create or update and the flows to delete, before anything is written, so that an override can reject the whole request on a permission or policy check. It does not validate the content of the flows, which can still fail after the deletions.
      */
-    @Put(uri = "{namespace}/{id}", consumes = MediaType.APPLICATION_JSON)
-    @ExecuteOn(TaskExecutors.IO)
-    @Operation(tags = {"Flows"}, operationId = "updateFlowFromJson", summary = "Update a flow", deprecated = true, hidden = true)
-    @Deprecated(forRemoval = true, since = "0.18")
-    @Hidden // we hide it otherwise this is the one that will be included in the OpenAPI spec instead of the JSON one.
-    public HttpResponse<Flow> updateFlowFromJson(
-        @Parameter(description = "The flow namespace") @PathVariable String namespace,
-        @Parameter(description = "The flow id") @PathVariable String id,
-        @RequestBody(description = "The flow") @Body Flow flow
-    ) throws ConstraintViolationException {
-        log.warn(WARNING_JSON_FLOW_ENDPOINT);
-
-        Optional<Flow> existingFlow = flowRepository.findById(tenantService.resolveTenant(), namespace, id);
-        if (existingFlow.isEmpty()) {
-            return HttpResponse.status(HttpStatus.NOT_FOUND);
-        }
-
-        GenericFlow genericFlow = parseFlowSource(flow.sourceOrGenerateIfNull());
-
-        return HttpResponse.ok(updateFlow(genericFlow, existingFlow.get()).toFlow());
-    }
-
-    protected FlowWithSource updateFlow(GenericFlow current, FlowInterface previous) {
-        return flowRepository.update(current, previous);
+    protected void validateBulkUpdate(List<GenericFlow> flows, List<FlowWithSource> toDelete) {
     }
 
     @ExecuteOn(TaskExecutors.IO)
-    @Post(uri = "bulk", consumes = MediaType.APPLICATION_YAML)
+    @Post(uri = "bulk", consumes = { KestraMediaTypes.APPLICATION_X_YAML, MediaType.APPLICATION_YAML })
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Update from multiples yaml sources",
         description = "All flow will be created / updated for this namespace.\n" +
-                      "Flow that already created but not in `flows` will be deleted if the query delete is `true`"
+            "Flow that already created but not in `flows` will be deleted if the query delete is `true`"
     )
     public List<FlowInterface> bulkUpdateFlows(
         @RequestBody(description = "A list of flows source code split with \"---\"") @Body @Nullable String flows,
         @Parameter(description = "If missing flow should be deleted") @QueryValue(defaultValue = "true") Boolean delete,
         @Parameter(description = "The namespace where to update flows") @QueryValue @Nullable String namespace,
-        @Parameter(description = "If namespace child should are allowed to be updated") @QueryValue(defaultValue = "false") Boolean allowNamespaceChild
-    ) throws ConstraintViolationException {
-        List<String> sources = flows != null ? List.of(flows.split("---")) : new ArrayList<>();
-        List<GenericFlow> genericFlows = sources.stream()
-            .map(source -> GenericFlow.fromYaml(tenantService.resolveTenant(), source))
-            .toList();
+        @Parameter(description = "If namespace child should are allowed to be updated") @QueryValue(defaultValue = "false") Boolean allowNamespaceChild) throws Exception {
+        List<GenericFlow> genericFlows = parseMultiFlowSource(flows);
         return this.bulkUpdateOrCreate(namespace, genericFlows, delete, allowNamespaceChild);
     }
 
-    /**
-     * @deprecated should not be used anymore
-     */
-    @Patch(uri = "{namespace}/{id}/{taskId}")
-    @ExecuteOn(TaskExecutors.IO)
-    @Operation(tags = {"Flows"}, summary = "Update a single task on a flow", deprecated = true)
-    @Deprecated(forRemoval = true, since = "0.18")
-    @SuppressWarnings("deprecated")
-    public HttpResponse<Flow> updateTask(
-        @Parameter(description = "The flow namespace") @PathVariable String namespace,
-        @Parameter(description = "The flow id") @PathVariable String id,
-        @Parameter(description = "The task id") @PathVariable String taskId,
-        @RequestBody(description = "The task") @Valid @Body Task task
-    ) throws ConstraintViolationException {
-        log.warn("This endpoint is deprecated: updating a single task is not longer supported and will be removed in a future release.");
-
-        Optional<Flow> existingFlow = flowRepository.findById(tenantService.resolveTenant(), namespace, id);
-
-        if (existingFlow.isEmpty()) {
-            return HttpResponse.status(HttpStatus.NOT_FOUND);
-        }
-
-        if (!taskId.equals(task.getId())) {
-            throw new IllegalArgumentException("Invalid taskId, previous '" + taskId + "' & current '" + task.getId() + "'");
-        }
-
-        Flow flow = existingFlow.get();
-        try {
-            Flow newValue = flow.updateTask(taskId, task);
-            String newSource = newValue.sourceOrGenerateIfNull();
-            return HttpResponse.ok(flowRepository.update(parseFlowSource(newSource), flow).toFlow());
-        } catch (InternalException e) {
-            return HttpResponse.status(HttpStatus.NOT_FOUND);
-        }
-    }
-
-
     @Delete(uri = "{namespace}/{id}")
     @ExecuteOn(TaskExecutors.IO)
-    @Operation(tags = {"Flows"}, summary = "Delete a flow")
+    @Operation(tags = { "Flows" }, summary = "Delete a flow")
     @ApiResponse(responseCode = "204", description = "On success")
     public HttpResponse<Void> deleteFlow(
         @Parameter(description = "The flow namespace") @PathVariable String namespace,
-        @Parameter(description = "The flow id") @PathVariable String id
-    ) {
+        @Parameter(description = "The flow id") @PathVariable String id) throws QueueException {
         Optional<FlowWithSource> flow = flowRepository.findByIdWithSource(tenantService.resolveTenant(), namespace, id);
         if (flow.isPresent()) {
-            flowRepository.delete(flow.get());
+            flowService.delete(flow.get());
             return HttpResponse.status(HttpStatus.NO_CONTENT);
         } else {
             return HttpResponse.status(HttpStatus.NOT_FOUND);
@@ -622,12 +646,11 @@ public class FlowController {
 
     @ExecuteOn(TaskExecutors.IO)
     @Delete(uri = "{namespace}/{id}/revisions")
-    @Operation(tags = {"Flows"}, summary = "Delete revisions for a flow")
+    @Operation(tags = { "Flows" }, summary = "Delete revisions for a flow")
     public HttpResponse<Void> deleteRevisions(
         @Parameter(description = "The flow namespace") @PathVariable String namespace,
         @Parameter(description = "The flow id") @PathVariable String id,
-        @QueryValue @NotEmpty List<@Min(1) Integer> revisions
-    ) {
+        @QueryValue @NotEmpty List<@Min(1) Integer> revisions) {
         Optional<FlowWithSource> flow = flowRepository.findByIdWithSource(tenantService.resolveTenant(), namespace, id);
         if (flow.isPresent()) {
             flowRepository.deleteRevisions(tenantService.resolveTenant(), namespace, id, revisions);
@@ -639,23 +662,20 @@ public class FlowController {
 
     @ExecuteOn(TaskExecutors.IO)
     @Get(uri = "distinct-namespaces")
-    @Operation(tags = {"Flows"}, summary = "List all distinct namespaces")
+    @Operation(tags = { "Flows" }, summary = "List all distinct namespaces")
     public List<String> listDistinctNamespaces(
-        @Parameter(description = "A string filter") @Nullable @QueryValue(value = "q") String query
-    ) {
+        @Parameter(description = "A string filter") @Nullable @QueryValue(value = "q") String query) {
         return flowRepository.findDistinctNamespace(tenantService.resolveTenant(), query);
     }
 
-
     @ExecuteOn(TaskExecutors.IO)
     @Get(uri = "{namespace}/{id}/dependencies")
-    @Operation(tags = {"Flows"}, summary = "Get flow dependencies")
+    @Operation(tags = { "Flows" }, summary = "Get flow dependencies")
     public FlowTopologyGraph getFlowDependencies(
         @Parameter(description = "The flow namespace") @PathVariable String namespace,
         @Parameter(description = "The flow id") @PathVariable String id,
         @Parameter(description = "If true, list only destination dependencies, otherwise list also source dependencies") @QueryValue(defaultValue = "false") boolean destinationOnly,
-        @Parameter(description = "If true, expand all dependencies recursively") @QueryValue(defaultValue = "false") boolean expandAll
-    ) {
+        @Parameter(description = "If true, expand all dependencies recursively") @QueryValue(defaultValue = "false") boolean expandAll) {
         Stream<FlowTopology> flowTopologyStream = flowService.findDependencies(tenantService.resolveTenant(), namespace, id, destinationOnly, expandAll);
 
         return flowTopologyService.graph(
@@ -665,12 +685,15 @@ public class FlowController {
     }
 
     @ExecuteOn(TaskExecutors.IO)
-    @Post(uri = "validate", consumes = {
-        MediaType.APPLICATION_YAML,
-        MediaType.MULTIPART_FORM_DATA
-    })
+    @Post(
+        uri = "validate", consumes = {
+            KestraMediaTypes.APPLICATION_X_YAML,
+            MediaType.APPLICATION_YAML,
+            MediaType.MULTIPART_FORM_DATA
+        }
+    )
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Validate a list of flows"
     )
     @RequestBody(
@@ -685,7 +708,7 @@ public class FlowController {
                 mediaType = MediaType.MULTIPART_FORM_DATA,
                 schema = @Schema(
                     type = "object",
-                    requiredProperties = {"flows"}
+                    requiredProperties = { "flows" }
                 )
             )
         }
@@ -693,15 +716,14 @@ public class FlowController {
     public List<ValidateConstraintViolation> validateFlows(
         @Parameter(hidden = true) @Body @Nullable String body,
         @Parameter(hidden = true) @Part("flows") @Nullable Publisher<CompletedFileUpload> flowsPublisher,
-        HttpRequest<?> request
-    ) throws IOException {
+        HttpRequest<?> request) throws IOException {
         String tenantId = tenantService.resolveTenant();
 
         MediaType contentType = request.getHeaders().contentType().orElse(MediaType.APPLICATION_JSON_TYPE);
 
         // If multipart parts are provided, process files
         if (contentType.matches(MediaType.MULTIPART_FORM_DATA_TYPE)) {
-            List<CompletedFileUpload> flowFiles = (flowsPublisher == null ? Flux.<CompletedFileUpload>empty() : Flux.from(flowsPublisher))
+            List<CompletedFileUpload> flowFiles = (flowsPublisher == null ? Flux.<CompletedFileUpload> empty() : Flux.from(flowsPublisher))
                 .collectList()
                 .blockOptional()
                 .orElse(Collections.emptyList());
@@ -716,7 +738,8 @@ public class FlowController {
         } else {
             // Fallback to YAML body
             String content = (body == null ? "" : body).trim();
-            List<FlowSource> flowSources = Arrays.stream(content.split("\\n+---\\n*?"))
+            List<FlowSource> flowSources = YamlParser.splitDocuments(content)
+                .stream()
                 .map(flow -> new FlowSource(null, flow))
                 .toList();
 
@@ -727,23 +750,22 @@ public class FlowController {
     // This endpoint is not used by the Kestra UI nor our CLI but is provided for the API users for convenience
     @ExecuteOn(TaskExecutors.IO)
     @Post(uri = "/validate/task", consumes = MediaType.APPLICATION_JSON)
-    @Operation(tags = {"Flows"}, summary = "Validate task")
+    @Operation(tags = { "Flows" }, summary = "Validate task")
     public ValidateConstraintViolation validateTask(
-        @RequestBody(description = "The task") @Schema(implementation = Object.class) @Body String task
-    ) {
+        @RequestBody(description = "The task") @Schema(implementation = Object.class) @Body String task) {
         ValidateConstraintViolation.ValidateConstraintViolationBuilder<?, ?> validateConstraintViolationBuilder = ValidateConstraintViolation.builder();
 
         try {
             var parsedTask = parseTaskTrigger(task, Task.class);
             modelValidator.validate(parsedTask);
         } catch (ConstraintViolationException e) {
-            validateConstraintViolationBuilder.constraints(e.getMessage());
+            validateConstraintViolationBuilder.errors(ValidationError.ofException(e));
         } catch (RuntimeException re) {
             // In case of any error, we add a validation violation so the error is displayed in the UI.
             // We may change that by throwing an internal error and handle it in the UI, but this should not occur except for rare cases
             // in dev like incompatible plugin versions.
             log.error("Unable to validate the task", re);
-            validateConstraintViolationBuilder.constraints("Unable to validate the task: " + re.getMessage());
+            validateConstraintViolationBuilder.errors(List.of(ValidationError.of("Unable to validate the task: " + re.getMessage())));
         }
 
         return validateConstraintViolationBuilder.build();
@@ -752,78 +774,68 @@ public class FlowController {
     // This endpoint is not used by the Kestra UI nor our CLI but is provided for the API users for convenience
     @ExecuteOn(TaskExecutors.IO)
     @Post(uri = "/validate/trigger", consumes = MediaType.APPLICATION_JSON)
-    @Operation(tags = {"Flows"}, summary = "Validate trigger")
+    @Operation(tags = { "Flows" }, summary = "Validate trigger")
     public ValidateConstraintViolation validateTrigger(
-        @RequestBody(description = "The trigger") @Schema(implementation = Object.class) @Body String trigger
-    ) {
+        @RequestBody(description = "The trigger") @Schema(implementation = Object.class) @Body String trigger) {
         ValidateConstraintViolation.ValidateConstraintViolationBuilder<?, ?> validateConstraintViolationBuilder = ValidateConstraintViolation.builder();
 
         try {
             var parsedTrigger = parseTaskTrigger(trigger, AbstractTrigger.class);
             modelValidator.validate(parsedTrigger);
         } catch (ConstraintViolationException e) {
-            validateConstraintViolationBuilder.constraints(e.getMessage());
+            validateConstraintViolationBuilder.errors(ValidationError.ofException(e));
         } catch (RuntimeException re) {
             // In case of any error, we add a validation violation so the error is displayed in the UI.
             // We may change that by throwing an internal error and handle it in the UI, but this should not occur except for rare cases
             // in dev like incompatible plugin versions.
             log.error("Unable to validate the trigger", re);
-            validateConstraintViolationBuilder.constraints("Unable to validate the trigger: " + re.getMessage());
+            validateConstraintViolationBuilder.errors(List.of(ValidationError.of("Unable to validate the trigger: " + re.getMessage())));
         }
         return validateConstraintViolationBuilder.build();
     }
 
     @ExecuteOn(TaskExecutors.IO)
-    @Post(uri = "/validate/task", consumes = MediaType.APPLICATION_YAML)
-    @Operation(tags = {"Flows"}, summary = "Validate a task")
+    @Post(uri = "/validate/task", consumes = { KestraMediaTypes.APPLICATION_X_YAML, MediaType.APPLICATION_YAML })
+    @Operation(tags = { "Flows" }, summary = "Validate a task")
     public ValidateConstraintViolation validateTask(
         @RequestBody(description = "A task definition that can be from tasks or triggers") @Schema(implementation = Object.class) @Body String task,
-        @Parameter(description = "The type of task") @QueryValue TaskValidationType section
-    ) {
+        @Parameter(description = "The flow section the definition belongs to (triggers, or any task-holding section: tasks, errors, finally, afterExecution)") @QueryValue String section) {
         ValidateConstraintViolation.ValidateConstraintViolationBuilder<?, ?> validateConstraintViolationBuilder = ValidateConstraintViolation.builder();
 
         try {
-            if (section == TaskValidationType.TASKS) {
-                Task taskParse = YamlParser.parse(task, Task.class);
-                modelValidator.validate(taskParse);
-            } else if (section == TaskValidationType.TRIGGERS) {
+            if ("triggers".equalsIgnoreCase(section)) {
                 AbstractTrigger triggerParse = YamlParser.parse(task, AbstractTrigger.class);
                 modelValidator.validate(triggerParse);
+            } else {
+                // Every other section (tasks, errors, finally, afterExecution) holds tasks.
+                Task taskParse = YamlParser.parse(task, Task.class);
+                modelValidator.validate(taskParse);
             }
         } catch (ConstraintViolationException e) {
-            validateConstraintViolationBuilder.constraints(e.getMessage());
+            validateConstraintViolationBuilder.errors(ValidationError.ofException(e));
         } catch (RuntimeException re) {
             // In case of any error, we add a validation violation so the error is displayed in the UI.
             // We may change that by throwing an internal error and handle it in the UI, but this should not occur except for rare cases
             // in dev like incompatible plugin versions.
             log.error("Unable to validate the flow", re);
-            validateConstraintViolationBuilder.constraints("Unable to validate the flow: " + re.getMessage());
+            validateConstraintViolationBuilder.errors(List.of(ValidationError.of("Unable to validate the flow: " + re.getMessage())));
         }
         return validateConstraintViolationBuilder.build();
-    }
-
-    public enum TaskValidationType {
-        TASKS,
-        TRIGGERS
     }
 
     @ExecuteOn(TaskExecutors.IO)
     @Get(uri = "/export/by-query", produces = MediaType.APPLICATION_OCTET_STREAM)
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Export flows as a ZIP archive of yaml sources."
     )
     public HttpResponse<byte[]> exportFlowsByQuery(
-        @Parameter(description = "Filters. PHP-style nested query is used - examples: `filters[labels][NOT_EQUALS][foo]=bar`, `filters[namespace][CONTAINS]=test`", in = ParameterIn.QUERY) @QueryFilterFormat List<QueryFilter> filters,
-
-        @Deprecated @Parameter(description = "A string filter", deprecated = true) @Nullable @QueryValue(value = "q") String query,
-        @Deprecated @Parameter(description = "The scope of the flows to include", deprecated = true) @Nullable @QueryValue List<FlowScope> scope,
-        @Deprecated @Parameter(description = "A namespace filter prefix", deprecated = true) @Nullable @QueryValue String namespace,
-        @Deprecated @Parameter(description = "A labels filter as a list of 'key:value'", deprecated = true) @Nullable @QueryValue @Format("MULTI") List<String> labels
-    ) throws IOException {
-        filters = mapLegacyQueryParamsToNewFilters(filters, query, scope, namespace, labels);
-
-        var flows = flowRepository.findWithSource(Pageable.UNPAGED, tenantService.resolveTenant(), filters);
+        @Parameter(description = "Filters. PHP-style nested query is used - examples: `filters[labels][NOT_EQUALS][foo]=bar`, `filters[namespace][CONTAINS]=test`", in = ParameterIn.QUERY)
+        @QueryFilterFormat(Resource.FLOW) List<QueryFilter> filters) throws IOException {
+        // Drafts are not exportable: a draft-headed flow falls back to its last saved revision, and a
+        // flow that has only ever been a draft is omitted. Consumers such as the Git sync plugin read
+        // this ZIP as the authoritative set of saved flows.
+        var flows = flowRepository.findWithSourceExcludingDrafts(Pageable.UNPAGED, tenantService.resolveTenant(), filters);
         var bytes = HasSource.asZipFile(flows, flow -> flow.getNamespace() + "-" + flow.getId() + ".yml");
 
         return HttpResponse.ok(bytes).header("Content-Disposition", "attachment; filename=\"flows.zip\"");
@@ -832,12 +844,11 @@ public class FlowController {
     @ExecuteOn(TaskExecutors.IO)
     @Post(uri = "/export/by-ids", produces = MediaType.APPLICATION_OCTET_STREAM)
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Export flows as a ZIP archive of yaml sources."
     )
     public HttpResponse<byte[]> exportFlowsByIds(
-        @RequestBody(description = "A list of tuple flow ID and namespace as flow identifiers") @Body List<IdWithNamespace> ids
-    ) throws IOException {
+        @RequestBody(description = "A list of tuple flow ID and namespace as flow identifiers") @Body List<IdWithNamespace> ids) throws IOException {
         var flows = ids.stream()
             .map(id -> flowRepository.findByIdWithSource(tenantService.resolveTenant(), id.getNamespace(), id.getId()).orElseThrow())
             .toList();
@@ -848,23 +859,17 @@ public class FlowController {
     @ExecuteOn(TaskExecutors.IO)
     @Delete(uri = "/delete/by-query")
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Delete flows returned by the query parameters."
     )
+    @ApiResponse(responseCode = "200", description = "On success", content = { @Content(schema = @Schema(implementation = BulkResponse.class)) })
     public HttpResponse<BulkResponse> deleteFlowsByQuery(
-        @Parameter(description = "Filters. PHP-style nested query is used - examples: `filters[labels][NOT_EQUALS][foo]=bar`, `filters[namespace][CONTAINS]=test`", in = ParameterIn.QUERY) @QueryFilterFormat List<QueryFilter> filters,
-
-        @Deprecated @Parameter(description = "A string filter", deprecated = true) @Nullable @QueryValue(value = "q") String query,
-        @Deprecated @Parameter(description = "The scope of the flows to include", deprecated = true) @Nullable @QueryValue List<FlowScope> scope,
-        @Deprecated @Parameter(description = "A namespace filter prefix", deprecated = true) @Nullable @QueryValue String namespace,
-        @Deprecated @Parameter(description = "A labels filter as a list of 'key:value'", deprecated = true) @Nullable @QueryValue @Format("MULTI") List<String> labels
-    ) {
-        filters = mapLegacyQueryParamsToNewFilters(filters, query, scope, namespace, labels);
-
+        @Parameter(description = "Filters. PHP-style nested query is used - examples: `filters[labels][NOT_EQUALS][foo]=bar`, `filters[namespace][CONTAINS]=test`", in = ParameterIn.QUERY)
+        @QueryFilterFormat(Resource.FLOW) List<QueryFilter> filters) throws QueueException {
         List<Flow> list = flowRepository
             .findWithSource(Pageable.UNPAGED, tenantService.resolveTenant(), filters)
             .stream()
-            .peek(flowRepository::delete)
+            .peek(throwConsumer(flow -> flowService.delete(flow)))
             .collect(Collectors.toList());
 
         return HttpResponse.ok(BulkResponse.builder().count(list.size()).build());
@@ -873,49 +878,55 @@ public class FlowController {
     @ExecuteOn(TaskExecutors.IO)
     @Delete(uri = "/delete/by-ids")
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Delete flows by their IDs."
     )
+    @ApiResponse(responseCode = "200", description = "On success", content = { @Content(schema = @Schema(implementation = BulkResponse.class)) })
+    @ApiResponse(responseCode = "400", description = "Validation errors", content = { @Content(schema = @Schema(implementation = ProblemDetail.class)) })
     public HttpResponse<BulkResponse> deleteFlowsByIds(
-        @RequestBody(description = "A list of tuple flow ID and namespace as flow identifiers") @Body List<IdWithNamespace> ids
-    ) {
-        List<Flow> list = ids
-            .stream()
-            .map(id -> flowRepository.findByIdWithSource(tenantService.resolveTenant(), id.getNamespace(), id.getId()).orElseThrow())
-            .peek(flowRepository::delete)
-            .collect(Collectors.toList());
+        @RequestBody(description = "A list of tuple flow ID and namespace as flow identifiers") @Body List<IdWithNamespace> ids) throws QueueException {
+            List<FlowWithSource> flows = new ArrayList<>();
+            List<ProblemError> invalids = new ArrayList<>();
 
-        return HttpResponse.ok(BulkResponse.builder().count(list.size()).build());
-    }
+            for (IdWithNamespace id : ids) {
+                Optional<FlowWithSource> flow = flowRepository.findByIdWithSource(tenantService.resolveTenant(), id.getNamespace(), id.getId());
+                if (flow.isPresent()) {
+                    flows.add(flow.get());
+                } else {
+                    invalids.add(flowProblem(id, "flow not found", ProblemTypes.NOT_FOUND));
+                }
+            }
+            if (!invalids.isEmpty()) {
+                throw new BulkValidationException("One or more flows could not be deleted.", invalids);
+            }
+
+            flows.forEach(throwConsumer(flow -> flowService.delete(flow)));
+
+            return HttpResponse.ok(BulkResponse.builder().count(flows.size()).build());
+        }
 
     @ExecuteOn(TaskExecutors.IO)
     @Post(uri = "/disable/by-query")
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Disable flows returned by the query parameters."
     )
+    @ApiResponse(responseCode = "200", description = "On success", content = { @Content(schema = @Schema(implementation = BulkResponse.class)) })
     public HttpResponse<BulkResponse> disableFlowsByQuery(
-        @Parameter(description = "Filters. PHP-style nested query is used - examples: `filters[labels][NOT_EQUALS][foo]=bar`, `filters[namespace][CONTAINS]=test`", in = ParameterIn.QUERY) @QueryFilterFormat List<QueryFilter> filters,
-
-        @Deprecated @Parameter(description = "A string filter", deprecated = true) @Nullable @QueryValue(value = "q") String query,
-        @Deprecated @Parameter(description = "The scope of the flows to include", deprecated = true) @Nullable @QueryValue List<FlowScope> scope,
-        @Deprecated @Parameter(description = "A namespace filter prefix", deprecated = true) @Nullable @QueryValue String namespace,
-        @Deprecated @Parameter(description = "A labels filter as a list of 'key:value'", deprecated = true) @Nullable @QueryValue @Format("MULTI") List<String> labels
-    ) {
-        filters = mapLegacyQueryParamsToNewFilters(filters, query, scope, namespace, labels);
-
+        @Parameter(description = "Filters. PHP-style nested query is used - examples: `filters[labels][NOT_EQUALS][foo]=bar`, `filters[namespace][CONTAINS]=test`", in = ParameterIn.QUERY)
+        @QueryFilterFormat(Resource.FLOW) List<QueryFilter> filters) throws Exception {
         return HttpResponse.ok(BulkResponse.builder().count(setFlowsDisableByQuery(filters, true).size()).build());
     }
 
     @ExecuteOn(TaskExecutors.IO)
     @Post(uri = "/disable/by-ids")
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Disable flows by their IDs."
     )
+    @ApiResponse(responseCode = "200", description = "On success", content = { @Content(schema = @Schema(implementation = BulkResponse.class)) })
     public HttpResponse<BulkResponse> disableFlowsByIds(
-        @RequestBody(description = "A list of tuple flow ID and namespace as flow identifiers") @Body List<IdWithNamespace> ids
-    ) {
+        @RequestBody(description = "A list of tuple flow ID and namespace as flow identifiers") @Body List<IdWithNamespace> ids) throws Exception {
 
         return HttpResponse.ok(BulkResponse.builder().count(setFlowsDisableByIds(ids, true).size()).build());
     }
@@ -923,58 +934,33 @@ public class FlowController {
     @ExecuteOn(TaskExecutors.IO)
     @Post(uri = "/enable/by-query")
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Enable flows returned by the query parameters."
     )
+    @ApiResponse(responseCode = "200", description = "On success", content = { @Content(schema = @Schema(implementation = BulkResponse.class)) })
     public HttpResponse<BulkResponse> enableFlowsByQuery(
-        @Parameter(description = "Filters. PHP-style nested query is used - examples: `filters[labels][NOT_EQUALS][foo]=bar`, `filters[namespace][CONTAINS]=test`", in = ParameterIn.QUERY) @QueryFilterFormat List<QueryFilter> filters,
-
-        @Deprecated @Parameter(description = "A string filter", deprecated = true) @Nullable @QueryValue(value = "q") String query,
-        @Deprecated @Parameter(description = "The scope of the flows to include", deprecated = true) @Nullable @QueryValue List<FlowScope> scope,
-        @Deprecated @Parameter(description = "A namespace filter prefix", deprecated = true) @Nullable @QueryValue String namespace,
-        @Deprecated @Parameter(description = "A labels filter as a list of 'key:value'", deprecated = true) @Nullable @QueryValue @Format("MULTI") List<String> labels
-    ) {
-        filters = mapLegacyQueryParamsToNewFilters(filters, query, scope, namespace, labels);
-
+        @Parameter(description = "Filters. PHP-style nested query is used - examples: `filters[labels][NOT_EQUALS][foo]=bar`, `filters[namespace][CONTAINS]=test`", in = ParameterIn.QUERY)
+        @QueryFilterFormat(Resource.FLOW) List<QueryFilter> filters) throws Exception {
         return HttpResponse.ok(BulkResponse.builder().count(setFlowsDisableByQuery(filters, false).size()).build());
-    }
-
-    protected static List<QueryFilter> mapLegacyQueryParamsToNewFilters(List<QueryFilter> filters, String query, List<FlowScope> scope, String namespace, List<String> labels) {
-        filters = RequestUtils.getFiltersOrDefaultToLegacyMapping(
-            filters,
-            query,
-            namespace,
-            null,
-            null,
-            null,
-            scope,
-            labels,
-            null,
-            null,
-            null,
-            null);
-
-        return filters;
     }
 
     @ExecuteOn(TaskExecutors.IO)
     @Post(uri = "/enable/by-ids")
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = "Enable flows by their IDs."
     )
+    @ApiResponse(responseCode = "200", description = "On success", content = { @Content(schema = @Schema(implementation = BulkResponse.class)) })
     public HttpResponse<BulkResponse> enableFlowsByIds(
-        @RequestBody(description = "A list of tuple flow ID and namespace as flow identifiers") @Body List<IdWithNamespace> ids
-    ) {
+        @RequestBody(description = "A list of tuple flow ID and namespace as flow identifiers") @Body List<IdWithNamespace> ids) throws Exception {
 
         return HttpResponse.ok(BulkResponse.builder().count(setFlowsDisableByIds(ids, false).size()).build());
     }
 
-
     @ExecuteOn(TaskExecutors.IO)
     @Post(uri = "/import", consumes = MediaType.MULTIPART_FORM_DATA)
     @Operation(
-        tags = {"Flows"},
+        tags = { "Flows" },
         summary = """
                 Import flows as a ZIP archive of yaml sources or a multi-objects YAML file.
                 When sending a Yaml that contains one or more flows, a list of index is returned.
@@ -985,12 +971,12 @@ public class FlowController {
     public HttpResponse<List<String>> importFlows(
         @Parameter(description = "The file to import, can be a ZIP archive or a multi-objects YAML file")
         @Part CompletedFileUpload fileUpload,
-        @Parameter(description = "If should fail on invalid flows") @QueryValue(defaultValue = "false") Boolean failOnError
-    ) throws IOException {
+        @Parameter(description = "If should fail on invalid flows") @QueryValue(defaultValue = "false") Boolean failOnError) throws IOException {
         String tenantId = tenantService.resolveTenant();
         final List<String> wrongFiles = new ArrayList<>();
         try {
-            HasSource.readSourceFile(fileUpload, (source, name) -> {
+            HasSource.readSourceFile(securityConfiguration.zipBombProtection(), fileUpload, (source, name) ->
+            {
                 try {
                     this.importFlow(tenantId, source);
                 } catch (Exception e) {
@@ -999,7 +985,7 @@ public class FlowController {
             });
         } catch (IOException e) {
             log.error("Unexpected error while importing flows", e);
-            fileUpload.discard();
+            IOUtils.closeQuietly(fileUpload);
             return HttpResponse.badRequest();
         }
         if (failOnError && !wrongFiles.isEmpty()) {
@@ -1010,18 +996,56 @@ public class FlowController {
 
     @Get(uri = "/export/by-query/csv", produces = MediaType.TEXT_CSV)
     @ExecuteOn(TaskExecutors.IO)
-    @Operation(tags = {"Flows"}, summary = "Export all flows as a streamed CSV file")
+    @Operation(tags = { "Flows" }, summary = "Export all flows as a streamed CSV file")
     @SuppressWarnings("unchecked")
-    public MutableHttpResponse<Flux> exportFlows(
-        @Parameter(description = "Filters. PHP-style nested query is used - examples: `filters[labels][NOT_EQUALS][foo]=bar`, `filters[namespace][CONTAINS]=test`", in = ParameterIn.QUERY) @QueryFilterFormat List<QueryFilter> filters
-    ) {
+    public MutableHttpResponse<Flux<String>> exportFlows(
+        @Parameter(description = "Filters. PHP-style nested query is used - examples: `filters[labels][NOT_EQUALS][foo]=bar`, `filters[namespace][CONTAINS]=test`", in = ParameterIn.QUERY)
+        @QueryFilterFormat(Resource.FLOW) List<QueryFilter> filters) {
         return HttpResponse.ok(
-                CSVUtils.toCSVFlux(
-                    flowRepository.findAsync(this.tenantService.resolveTenant(), filters)
-                        .map(log -> objectMapper.convertValue(log, Map.class))
-                )
+            CSVUtils.toCSVFlux(
+                flowRepository.findAsync(this.tenantService.resolveTenant(), filters),
+                objectMapper
             )
+        )
             .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=flows.csv");
+    }
+
+    @ExecuteOn(TaskExecutors.IO)
+    @Post(uri = "expressions", consumes = { KestraMediaTypes.APPLICATION_X_YAML, MediaType.APPLICATION_YAML })
+    @Operation(
+        tags = { "Flows" },
+        summary = "Get available Pebble expressions for a flow",
+        description = "Returns a categorized map of expression strings available for autocompletion in the No-Code editor."
+    )
+    @ApiResponse(responseCode = "200", description = "Categorized expressions map")
+    public ExpressionContext expressions(
+        @RequestBody(description = "The flow source code") @Body String source,
+        @Parameter(description = "Optional task ID to scope outputs to prior tasks") @Nullable @QueryValue String taskId) throws ConstraintViolationException {
+        try {
+            FlowWithSource flowParsed = flowParsingService.parse(tenantService.resolveTenant(), source, false);
+            return expressionContextService.buildExpressionContext(flowParsed, taskId, excludedExpressionCategories(flowParsed));
+        } catch (FlowProcessingException e) {
+            if (e.getCause() instanceof ConstraintViolationException cve) {
+                throw cve;
+            }
+            throw new HttpStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        }
+    }
+
+    /**
+     * Hook for subclasses to exclude expression categories the caller is not permitted
+     * to see. Default (OSS): no exclusions. Overridden in EE to gate SECRETS / KV_PAIRS /
+     * NAMESPACE_FILES on the corresponding namespace permissions.
+     */
+    protected Set<ExpressionCategory> excludedExpressionCategories(Flow flow) {
+        return Set.of();
+    }
+
+    protected List<GenericFlow> parseMultiFlowSource(@Nullable String flows) {
+        return YamlParser.splitDocuments(flows)
+            .stream()
+            .map(this::parseFlowSource)
+            .toList();
     }
 
     protected GenericFlow parseFlowSource(final String source) {
@@ -1032,35 +1056,73 @@ public class FlowController {
         flowService.importFlow(tenantId, source);
     }
 
-    protected List<FlowWithSource> setFlowsDisableByIds(List<IdWithNamespace> ids, boolean disable) {
+    protected List<FlowWithSource> setFlowsDisableByIds(List<IdWithNamespace> ids, boolean disable) throws Exception {
         return ids
             .stream()
             .map(id -> flowRepository.findByIdWithSource(tenantService.resolveTenant(), id.getNamespace(), id.getId()).orElseThrow())
             .filter(flowWithSource -> disable != flowWithSource.isDisabled())
-            .peek(flow -> {
+            .peek(throwConsumer(flow ->
+            {
                 GenericFlow genericFlowUpdated = parseFlowSource(FlowService.injectDisabled(flow.getSource(), disable));
-                flowRepository.update(genericFlowUpdated, flow);
-            })
+                flowService.update(genericFlowUpdated, flow);
+            }))
             .toList();
     }
 
-    protected List<FlowWithSource> setFlowsDisableByQuery(List<QueryFilter> filters, boolean disable) {
+    protected List<FlowWithSource> setFlowsDisableByQuery(List<QueryFilter> filters, boolean disable) throws Exception {
         return flowRepository
             .findWithSource(Pageable.UNPAGED, tenantService.resolveTenant(), filters)
             .stream()
             .filter(flowWithSource -> disable != flowWithSource.isDisabled())
-            .peek(flow -> {
+            .peek(throwConsumer(flow ->
+            {
                 GenericFlow genericFlowUpdated = parseFlowSource(FlowService.injectDisabled(flow.getSource(), disable));
-                flowRepository.update(genericFlowUpdated, flow);
-            })
+                flowService.update(genericFlowUpdated, flow);
+            }))
             .toList();
     }
 
     protected <T> T parseTaskTrigger(String input, Class<T> cls) throws ConstraintViolationException {
         try {
-            return JacksonMapper.ofJson().readValue(input, cls);
+            return JacksonMapper.ofJson(true).readValue(input, cls);
         } catch (JsonProcessingException e) {
             throw YamlParser.toConstraintViolationException(input, cls.getSimpleName(), e);
         }
+    }
+
+    @ExecuteOn(TaskExecutors.IO)
+    @Get("/deprecated")
+    @Operation(tags = { "Flows" }, summary = "List flows containing deprecated tasks")
+    public List<FlowWithDeprecatedTasks> listDeprecated(
+        @Parameter(description = "A namespace filter prefix") @Nullable @QueryValue String namespace) {
+        List<Flow> flows = namespace != null
+            ? flowService.findByNamespace(tenantService.resolveTenant(), namespace)
+            : flowService.findAll(tenantService.resolveTenant());
+        return flows.stream()
+            .map(flow ->
+            {
+                List<FlowService.TaskDeprecation> deprecatedTasks = flowService.findDeprecatedTasks(flow);
+                if (deprecatedTasks.isEmpty())
+                    return null;
+                return new FlowWithDeprecatedTasks(
+                    flow.getNamespace(),
+                    flow.getId(),
+                    flow.getRevision(),
+                    deprecatedTasks
+                );
+            })
+            .filter(Objects::nonNull)
+            .toList();
+    }
+
+    public record FlowWithDeprecatedTasks(
+        String namespace,
+        String flowId,
+        Integer revision,
+        List<FlowService.TaskDeprecation> deprecatedTasks) {
+    }
+
+        private static ProblemError flowProblem(IdWithNamespace id, String detail, ProblemType type) {
+        return ProblemError.ofItem(detail, "flows[" + id.getNamespace() + "." + id.getId() + "]", type);
     }
 }

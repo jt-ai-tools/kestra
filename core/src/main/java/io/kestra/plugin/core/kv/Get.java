@@ -1,25 +1,25 @@
 package io.kestra.plugin.core.kv;
 
-import io.kestra.core.exceptions.ResourceExpiredException;
+import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.Optional;
+
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.tasks.RunnableTask;
 import io.kestra.core.models.tasks.Task;
+import io.kestra.core.runners.DefaultRunContext;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.storages.kv.KVValue;
+
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
-import java.io.IOException;
-import java.util.Objects;
 import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.experimental.SuperBuilder;
 import lombok.extern.slf4j.Slf4j;
-
-import java.util.NoSuchElementException;
-import java.util.Optional;
 
 @Slf4j
 @SuperBuilder(toBuilder = true)
@@ -72,7 +72,6 @@ public class Get extends Task implements RunnableTask<Get.Output> {
     @Builder.Default
     private Property<Boolean> errorOnMissing = Property.ofValue(false);
 
-
     @Override
     public Output run(RunContext runContext) throws Exception {
         String renderedNamespace = runContext.render(this.namespace).as(String.class).orElse(null);
@@ -81,7 +80,7 @@ public class Get extends Task implements RunnableTask<Get.Output> {
 
         Optional<KVValue> value;
         if (Objects.equals(renderedNamespace, flowNamespace)) {
-            value = getValueWithInheritance(runContext, flowNamespace, renderedKey);
+            value = ((DefaultRunContext) runContext).services().kvStoreService().findValueWithInheritance(runContext.flowInfo().tenantId(), flowNamespace, renderedKey);
         } else {
             runContext.acl().allowNamespace(renderedNamespace).check();
             value = runContext.namespaceKv(renderedNamespace).getValue(renderedKey);
@@ -94,21 +93,6 @@ public class Get extends Task implements RunnableTask<Get.Output> {
         return Output.builder()
             .value(value.map(KVValue::value).orElse(null))
             .build();
-    }
-
-    private Optional<KVValue> getValueWithInheritance(RunContext runContext, String flowNamespace, String renderedKey)
-            throws IOException, ResourceExpiredException {
-        Optional<KVValue> value = Optional.empty();
-        String inheritedNamespace = flowNamespace;
-        while (value.isEmpty()) {
-
-            value = runContext.namespaceKv(inheritedNamespace).getValue(renderedKey);
-            if (!inheritedNamespace.contains(".")){
-                return value;
-            }
-            inheritedNamespace = inheritedNamespace.substring(0, inheritedNamespace.lastIndexOf('.'));
-        }
-        return value;
     }
 
     @Builder

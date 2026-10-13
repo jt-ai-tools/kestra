@@ -1,52 +1,69 @@
 <template>
-    <el-select
+    <KsSelect
         :modelValue="values"
         @update:model-value="onInput"
         filterable
         clearable
-        :persistent="false"
         allowCreate
-        :placeholder="task.namespace ? 'Select' : 'Select namespace first'"
-        :disabled="!task.namespace"
+        :placeholder="task?.namespace ? $t('select') : $t('no_code.select.namespace_first')"
+        :disabled="!task?.namespace"
     >
-        <el-option
+        <KsOption
             v-for="item in flowIds"
             :key="item"
             :label="item"
             :value="item"
         />
-    </el-select>
+    </KsSelect>
 </template>
-<script>
-    import {mapStores} from "pinia";
-    import {useFlowStore} from "../../../../stores/flow";
-    import Task from "./MixinTask";
+<script setup lang="ts">
+    import {computed, ref, watch} from "vue"
+    import {collapseEmptyValues} from "../utils/collapseEmptyValues"
+    import {useFlowStore} from "../../../../stores/flow"
 
-    export default {
-        mixins: [Task],
-        data() {
-            return {
-                flowIds: []
-            }
-        },
-        watch: {
-            namespace: {
-                immediate: true,
-                async handler() {
-                    this.flowIds = (await this.flowStore.flowsByNamespace(this.namespace))
-                        .map(flow => flow.id);
+    type ModelValue = object | string | number | boolean | unknown[]
 
-                    if (this.namespace === this.flowStore.flow.namespace) {
-                        this.flowIds = this.flowIds.filter(id => id !== this.flowStore.flow.id)
-                    }
-                }
-            }
-        },
-        computed: {
-            ...mapStores(useFlowStore),
-            namespace() {
-                return this.task?.namespace ?? this.flowStore.flow?.namespace;
-            },
+    const props = withDefaults(defineProps<{
+        modelValue?: ModelValue
+        schema?: Record<string, unknown>
+        required?: boolean
+        task?: Record<string, unknown>
+        root?: string
+        definitions?: Record<string, unknown>
+    }>(), {
+        modelValue: undefined,
+        schema: undefined,
+        required: false,
+        task: undefined,
+        root: undefined,
+        definitions: undefined,
+    })
+
+    const emit = defineEmits<{
+        "update:modelValue": [value: ModelValue | undefined]
+    }>()
+
+    const flowStore = useFlowStore()
+
+    const flowIds = ref<string[]>([])
+
+    const values = computed(() => props.modelValue ?? (props.schema?.default as ModelValue | undefined))
+
+    const namespace = computed(() => {
+        return (props.task?.namespace as string | undefined) ?? flowStore.flow?.namespace
+    })
+
+    watch(namespace, async () => {
+        if (!namespace.value) return
+        flowIds.value = ((await flowStore.flowsByNamespace(namespace.value)) as {id: string}[])
+            .map((flow: {id: string}) => flow.id)
+
+        if (namespace.value === flowStore.flow?.namespace) {
+            flowIds.value = flowIds.value.filter(id => id !== flowStore.flow?.id)
         }
-    };
+    }, {immediate: true})
+
+    function onInput(value: ModelValue | undefined) {
+        emit("update:modelValue", collapseEmptyValues(value))
+    }
 </script>

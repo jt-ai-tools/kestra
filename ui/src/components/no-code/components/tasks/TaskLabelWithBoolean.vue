@@ -6,17 +6,17 @@
 </template>
 
 <script setup lang="ts">
-    import TaskBoolean from "./TaskBoolean.vue";
+    import TaskBoolean from "./TaskBoolean.vue"
 
     interface Props {
         type?: string
         isBoolean?: boolean
-        componentProps?: Record<string, any>
+        componentProps?: Record<string, unknown>
     }
 
     withDefaults(defineProps<Props>(), {
         type: "",
         isBoolean: false,
-        componentProps: () => ({})
+        componentProps: () => ({}),
     })
 </script>

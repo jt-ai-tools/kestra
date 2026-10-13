@@ -1,9 +1,15 @@
-import {beforeAll} from "vitest";
-import {setProjectAnnotations} from "@storybook/vue3-vite";
-import * as projectAnnotations from "./preview";
+// Must stay the FIRST import: it patches window.fetch before any src/ or SDK module is evaluated.
+// preview.ts imports it too — the install is idempotent. Importing from both files removes any
+// dependence on the relative order of this setup file and the one addon-vitest injects itself.
+import "./apiMock"
 
-// This is an important step to apply the right configuration when testing your stories.
-// More info at: https://storybook.js.org/docs/api/portable-stories/portable-stories-vitest#setprojectannotations
-const project = setProjectAnnotations([projectAnnotations]);
-
-beforeAll(project.beforeAll);
+// Story templates are runtime-compiled by Vue in the browser, which triggers
+// "@vue/compiler-core: decodeEntities option is passed but will be ignored in
+// non-browser builds" — a false-positive from the esm-bundler Vue build that
+// sets __BROWSER__=false even in browser environments.
+// Suppress it so test output stays clean.
+const origWarn = console.warn.bind(console)
+console.warn = (...args: unknown[]) => {
+    if (typeof args[0] === "string" && args[0].includes("decodeEntities")) return
+    origWarn(...args)
+}

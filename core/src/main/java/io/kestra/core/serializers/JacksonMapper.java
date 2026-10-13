@@ -1,6 +1,18 @@
 
 package io.kestra.core.serializers;
 
+import java.io.IOException;
+import java.time.Duration;
+import java.time.ZoneId;
+import java.util.List;
+import java.util.Map;
+import java.util.ServiceLoader;
+import java.util.TimeZone;
+import java.util.stream.StreamSupport;
+
+import org.apache.commons.lang3.tuple.Pair;
+import org.yaml.snakeyaml.LoaderOptions;
+
 import com.amazon.ion.IonSystem;
 import com.amazon.ion.system.*;
 import com.fasterxml.jackson.annotation.JsonInclude;
@@ -9,6 +21,7 @@ import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.Module;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.module.SimpleModule;
@@ -23,28 +36,23 @@ import com.fasterxml.jackson.module.paramnames.ParameterNamesModule;
 import com.github.fge.jsonpatch.JsonPatch;
 import com.github.fge.jsonpatch.JsonPatchException;
 import com.github.fge.jsonpatch.diff.JsonDiff;
+
 import io.kestra.core.plugins.PluginModule;
-import io.kestra.core.runners.RunContextModule;
 import io.kestra.core.serializers.ion.IonFactory;
 import io.kestra.core.serializers.ion.IonModule;
-import org.apache.commons.lang3.tuple.Pair;
-import org.yaml.snakeyaml.LoaderOptions;
-
-import java.io.IOException;
-import java.time.Duration;
-import java.time.ZoneId;
-import java.util.List;
-import java.util.Map;
-import java.util.TimeZone;
 
 import static com.fasterxml.jackson.core.StreamReadConstraints.DEFAULT_MAX_STRING_LEN;
 
 public final class JacksonMapper {
-    public static final TypeReference<Map<String, Object>> MAP_TYPE_REFERENCE = new TypeReference<>() {};
-    public static final TypeReference<List<Object>> LIST_TYPE_REFERENCE = new TypeReference<>() {};
-    public static final TypeReference<Object> OBJECT_TYPE_REFERENCE = new TypeReference<>() {};
+    public static final TypeReference<Map<String, Object>> MAP_TYPE_REFERENCE = new TypeReference<>() {
+    };
+    public static final TypeReference<List<Object>> LIST_TYPE_REFERENCE = new TypeReference<>() {
+    };
+    public static final TypeReference<Object> OBJECT_TYPE_REFERENCE = new TypeReference<>() {
+    };
 
-    private JacksonMapper() {}
+    private JacksonMapper() {
+    }
 
     static {
         StreamReadConstraints.overrideDefaultStreamReadConstraints(
@@ -52,16 +60,17 @@ public final class JacksonMapper {
         );
     }
 
-    private static final ObjectMapper MAPPER = JacksonMapper.configure(
-        new ObjectMapper()
-    );
+    // Registered the KestraDateTimeModule only for the JSON mapper.
+    // YAML should not change the date format as it would break compatibility, and ION has its own date format.
+    private static final ObjectMapper MAPPER = JacksonMapper.configure(new ObjectMapper())
+        .registerModule(new KestraDateTimeModule());
 
     private static final ObjectMapper NON_STRICT_MAPPER = MAPPER
         .copy()
         .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
     public static ObjectMapper ofJson() {
-        return JacksonMapper.ofJson(true);
+        return JacksonMapper.ofJson(false);
     }
 
     public static ObjectMapper ofJson(boolean strict) {
@@ -78,7 +87,7 @@ public final class JacksonMapper {
                 .configure(YAMLGenerator.Feature.USE_NATIVE_TYPE_ID, false)
                 .configure(YAMLGenerator.Feature.SPLIT_LINES, false)
                 .build()
-        )
+        ).configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
     );
 
     public static ObjectMapper ofYaml() {
@@ -96,6 +105,19 @@ public final class JacksonMapper {
         return MAPPER.convertValue(object, MAP_TYPE_REFERENCE);
     }
 
+    /**
+     * Keeps null map entries and collection elements ({@code ALWAYS} content inclusion) while still omitting null
+     * bean properties ({@code NON_NULL} value inclusion). The single-argument {@code setDefaultPropertyInclusion}
+     * used by the other mappers sets both, which is why they drop null map entries.
+     */
+    private static final ObjectMapper MAPPER_WITH_NULL = MAPPER
+        .copy()
+        .setDefaultPropertyInclusion(JsonInclude.Value.construct(JsonInclude.Include.NON_NULL, JsonInclude.Include.ALWAYS));
+
+    public static ObjectMapper ofJsonWithNullValues() {
+        return MAPPER_WITH_NULL;
+    }
+
     public static <T> T toMap(Object map, Class<T> cls) {
         return MAPPER.convertValue(map, cls);
     }
@@ -109,7 +131,8 @@ public final class JacksonMapper {
     }
 
     public static List<String> toList(Object object) {
-        return MAPPER.convertValue(object, new TypeReference<>() {});
+        return MAPPER.convertValue(object, new TypeReference<>() {
+        });
     }
 
     public static Object toObject(String json) throws JsonProcessingException {
@@ -128,10 +151,15 @@ public final class JacksonMapper {
         }
     }
 
-    private static final ObjectMapper ION_MAPPER = createIonObjectMapper();
+    private static final ObjectMapper ION_MAPPER = createIonObjectMapper(false);
+    private static final ObjectMapper ION_BINARY_MAPPER = createIonObjectMapper(true);
 
     public static ObjectMapper ofIon() {
         return ION_MAPPER;
+    }
+
+    public static ObjectMapper ofIonBinary() {
+        return ION_BINARY_MAPPER;
     }
 
     private static ObjectMapper configure(ObjectMapper mapper) {
@@ -146,24 +174,39 @@ public final class JacksonMapper {
             .registerModule(new ParameterNamesModule())
             .registerModules(new GuavaModule())
             .registerModule(new PluginModule())
-            .registerModule(new RunContextModule())
+            .registerModules(additionalModules())
             .registerModule(durationDeserialization)
             .setTimeZone(TimeZone.getDefault());
     }
 
-    private static ObjectMapper createIonObjectMapper() {
-        return configure(new IonObjectMapper(new IonFactory(createIonSystem())))
+    /** Modules contributed via {@link JacksonMapperModuleProvider}, since {@code core} can't depend on them directly. */
+    private static Module[] additionalModules() {
+        return StreamSupport.stream(
+            ServiceLoader.load(JacksonMapperModuleProvider.class, JacksonMapper.class.getClassLoader()).spliterator(),
+            false
+        )
+            .map(JacksonMapperModuleProvider::module)
+            .toArray(Module[]::new);
+    }
+
+    private static ObjectMapper createIonObjectMapper(boolean binary) {
+        IonFactory ionFactory = new IonFactory(createIonSystem());
+        if (binary) {
+            ionFactory.setCreateBinaryWriters(true);
+        }
+        return configure(new IonObjectMapper(ionFactory))
             .setDefaultPropertyInclusion(JsonInclude.Include.ALWAYS)
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
             .registerModule(new IonModule());
     }
 
     private static IonSystem createIonSystem() {
-         return IonSystemBuilder.standard()
+        return IonSystemBuilder.standard()
             .withIonTextWriterBuilder(IonTextWriterBuilder.standard().withWriteTopLevelValuesOnNewLines(true))
             .build();
     }
 
-    public static Pair<JsonNode, JsonNode> getBiDirectionalDiffs(Object before, Object after)  {
+    public static Pair<JsonNode, JsonNode> getBiDirectionalDiffs(Object before, Object after) {
         JsonNode beforeNode = MAPPER.valueToTree(before);
         JsonNode afterNode = MAPPER.valueToTree(after);
 

@@ -1,5 +1,13 @@
 package io.kestra.plugin.scripts.exec;
 
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.apache.commons.lang3.SystemUtils;
+
 import io.kestra.core.exceptions.IllegalVariableEvaluationException;
 import io.kestra.core.models.annotations.PluginProperty;
 import io.kestra.core.models.property.Property;
@@ -13,18 +21,12 @@ import io.kestra.plugin.scripts.exec.scripts.models.RunnerType;
 import io.kestra.plugin.scripts.exec.scripts.runners.CommandsWrapper;
 import io.kestra.plugin.scripts.runner.docker.Docker;
 import io.kestra.plugin.scripts.runner.docker.PullPolicy;
+
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
 import lombok.*;
 import lombok.experimental.SuperBuilder;
-import org.apache.commons.lang3.SystemUtils;
-
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 
 @SuperBuilder
 @ToString
@@ -47,6 +49,7 @@ public abstract class AbstractExecScript extends Task implements NamespaceFilesI
     )
     @PluginProperty
     @Builder.Default
+    @NotNull
     @Valid
     protected TaskRunner<?> taskRunner = Docker.builder()
         .type(Docker.class.getName())
@@ -80,7 +83,8 @@ public abstract class AbstractExecScript extends Task implements NamespaceFilesI
     @Builder.Default
     @Schema(
         title = "Fail the task on the first command with a non-zero status.",
-        description = "If set to `false` all commands will be executed one after the other. The final state of task execution is determined by the last command. Note that this property maybe be ignored if a non compatible interpreter is specified." +
+        description = "If set to `false` all commands will be executed one after the other. The final state of task execution is determined by the last command. Note that this property maybe be ignored if a non compatible interpreter is specified."
+            +
             "\nYou can also disable it if your interpreter does not support the `set -e`option."
     )
     protected Property<Boolean> failFast = Property.ofValue(true);
@@ -89,6 +93,13 @@ public abstract class AbstractExecScript extends Task implements NamespaceFilesI
 
     private Object inputFiles;
 
+    @Schema(
+        title = "List of output file names to capture after execution.",
+        description = """
+            Declares files produced by the script that should be uploaded to Kestra's internal storage.
+            Use `{{ outputFiles["filename"] }}` in your script body to get the resolved absolute path — this works for local runners (Process, Docker) and remote runners (Kubernetes, cloud batch).
+            Glob patterns (e.g. `*.csv`) are supported for post-run collection but cannot be referenced via Pebble expressions inside the script."""
+    )
     private Property<List<String>> outputFiles;
 
     @Schema(
@@ -101,19 +112,21 @@ public abstract class AbstractExecScript extends Task implements NamespaceFilesI
     private Property<Boolean> outputDirectory;
 
     @Schema(
+        title = "Whether to write the execution context to a `.kestra-execution-context.json` file in the working directory.",
+        description = """
+            Gives the script its execution metadata — `inputs`, `outputs`, `labels`, `vars`, `trigger`, `flow`, `execution` — as JSON data instead of Pebble expressions interpolated into its source, which keeps the script valid, lintable code in an IDE and safe for values holding quotes or newlines.
+            The Python client reads it with `from kestra import context`, then `context.outputs.previous_task.uri`.
+            Disabled by default: the file holds the same values the task could already render, secret-typed inputs included, so it is only written when asked for.""",
+        defaultValue = "false"
+    )
+    private Property<Boolean> executionContext;
+
+    @Schema(
         title = "The target operating system where the script will run."
     )
     @Builder.Default
     @NotNull
     protected Property<TargetOS> targetOS = Property.ofValue(TargetOS.AUTO);
-
-    @Schema(
-        title = "Deprecated - use the 'taskRunner' property instead.",
-        description = "Only used if the `taskRunner` property is not set",
-        deprecated = true
-    )
-    @Deprecated
-    protected DockerOptions docker;
 
     @Schema(
         title = "The task runner container image, only used if the task runner is container-based."
@@ -132,15 +145,18 @@ public abstract class AbstractExecScript extends Task implements NamespaceFilesI
      * Allow setting Docker options defaults values.
      * To make it work, it is advised to set the 'docker' field like:
      *
-     * <pre>{@code
-     *     @Schema(
+     * <pre>
+     * {
+     *     &#64;code
+     *     &#64;Schema(
      *         title = "Docker options when using the `DOCKER` runner",
      *         defaultValue = "{image=python, pullPolicy=ALWAYS}"
      *     )
-     *     @PluginProperty
+     *     &#64;PluginProperty
      *     @Builder.Default
      *     protected DockerOptions docker = DockerOptions.builder().build();
-     * }</pre>
+     * }
+     * </pre>
      */
     protected DockerOptions injectDefaults(RunContext runContext, @NotNull DockerOptions original) throws IllegalVariableEvaluationException {
         // FIXME to keep backward compatibility, we call the old method from the new one by default
@@ -148,24 +164,19 @@ public abstract class AbstractExecScript extends Task implements NamespaceFilesI
     }
 
     protected CommandsWrapper commands(RunContext runContext) throws IllegalVariableEvaluationException {
-        if (this.getRunner() == null) {
-            runContext.logger().debug("Using task runner '{}'", this.getTaskRunner().getType());
-        }
-
         Map<String, String> renderedEnv = runContext.render(this.getEnv()).asMap(String.class, String.class);
         return new CommandsWrapper(runContext)
             .withEnv(renderedEnv.isEmpty() ? new HashMap<>() : renderedEnv)
-            .withRunnerType(this.getRunner())
             .withContainerImage(runContext.render(this.getContainerImage()).as(String.class).orElse(null))
             .withTaskRunner(this.getTaskRunner())
-            .withDockerOptions(this.getDocker() != null ? this.injectDefaults(runContext, this.getDocker()) : null)
             .withNamespaceFiles(this.getNamespaceFiles())
             .withInputFiles(this.getInputFiles())
             .withOutputFiles(runContext.render(this.getOutputFiles()).asList(String.class))
             .withEnableOutputDirectory(runContext.render(this.getOutputDirectory()).as(Boolean.class).orElse(null))
             .withTimeout(runContext.render(this.getTimeout()).as(Duration.class).orElse(null))
             .withTargetOS(runContext.render(this.getTargetOS()).as(TargetOS.class).orElseThrow())
-            .withFailFast(runContext.render(this.getFailFast()).as(Boolean.class).orElse(false));
+            .withFailFast(runContext.render(this.getFailFast()).as(Boolean.class).orElse(false))
+            .withExecutionContext(runContext.render(this.getExecutionContext()).as(Boolean.class).orElse(false));
     }
 
     /**
@@ -193,14 +204,17 @@ public abstract class AbstractExecScript extends Task implements NamespaceFilesI
 
     /**
      * Gets the list of additional commands to be used for defining interpreter errors handling.
-     * @return   list of commands;
+     * 
+     * @return list of commands;
      */
     protected List<String> getExitOnErrorCommands(RunContext runContext) throws IllegalVariableEvaluationException {
         TargetOS rendered = runContext.render(this.getTargetOS()).as(TargetOS.class).orElseThrow();
 
         // If targetOS is Windows OR targetOS is AUTO && current system is windows and we use process as a runner.(TLDR will run on windows)
-        if (rendered == TargetOS.WINDOWS ||
-            (rendered == TargetOS.AUTO && SystemUtils.IS_OS_WINDOWS && this.getTaskRunner() instanceof Process)) {
+        if (
+            rendered == TargetOS.WINDOWS ||
+                (rendered == TargetOS.AUTO && SystemUtils.IS_OS_WINDOWS && this.getTaskRunner() instanceof Process)
+        ) {
             return List.of("");
         }
         // errexit option may be unsupported by non-shell interpreter.

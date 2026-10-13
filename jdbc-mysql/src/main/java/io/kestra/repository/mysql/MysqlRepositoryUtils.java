@@ -1,10 +1,11 @@
 package io.kestra.repository.mysql;
 
-import io.kestra.core.utils.DateUtils;
+import java.util.Date;
+
 import org.jooq.Field;
 import org.jooq.impl.DSL;
 
-import java.util.Date;
+import io.kestra.core.utils.DateUtils;
 
 public final class MysqlRepositoryUtils {
     private MysqlRepositoryUtils() {
@@ -14,7 +15,7 @@ public final class MysqlRepositoryUtils {
     public static Field<Date> formatDateField(String dateField, DateUtils.GroupType groupType) {
         switch (groupType) {
             case MONTH:
-                return DSL.field("DATE_FORMAT({0}, '%Y-%m')", Date.class, DSL.field(dateField));
+                return DSL.field("STR_TO_DATE(DATE_FORMAT(now(), '%Y-%m-01'), '%Y-%m-%d')", Date.class, DSL.field(dateField));
             case WEEK:
                 return DSL.field("STR_TO_DATE(CONCAT(YEARWEEK({0}, 3), ' Monday'), '%X%V %W')", Date.class, DSL.field(dateField));
             case DAY:

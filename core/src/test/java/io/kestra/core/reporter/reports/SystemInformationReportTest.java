@@ -1,18 +1,20 @@
 package io.kestra.core.reporter.reports;
 
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+import org.junit.jupiter.api.Test;
+
 import io.kestra.core.models.Setting;
 import io.kestra.core.repositories.SettingRepositoryInterface;
+
 import io.micronaut.test.annotation.MockBean;
 import io.micronaut.test.extensions.junit5.annotation.MicronautTest;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import jakarta.validation.ConstraintViolationException;
-import org.junit.jupiter.api.Test;
-
-import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -34,6 +36,8 @@ class SystemInformationReportTest {
         assertThat(event.host().getOs().getFamily()).isNotNull();
         assertThat(event.configurations().getRepositoryType()).isEqualTo("h2");
         assertThat(event.configurations().getQueueType()).isEqualTo("h2");
+        // kestra.logs.type is not configured here, so the raw property reports null (logs kept in the main DB)
+        assertThat(event.configurations().getLogDataStoreType()).isNull();
     }
 
     @MockBean(SettingRepositoryInterface.class)

@@ -1,14 +1,13 @@
 package io.kestra.core.plugins;
 
-import io.kestra.core.contexts.MavenPluginRepositoryConfig;
-import io.kestra.core.exceptions.KestraRuntimeException;
-import io.kestra.core.utils.Version;
-import io.micronaut.context.annotation.Value;
-import io.micronaut.core.annotation.Nullable;
-import jakarta.annotation.PreDestroy;
-import jakarta.inject.Inject;
-import jakarta.inject.Singleton;
-import lombok.extern.slf4j.Slf4j;
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+
 import org.apache.commons.io.FileUtils;
 import org.apache.maven.repository.internal.MavenRepositorySystemUtils;
 import org.eclipse.aether.DefaultRepositorySystemSession;
@@ -26,19 +25,20 @@ import org.eclipse.aether.resolution.VersionRangeRequest;
 import org.eclipse.aether.resolution.VersionRangeResolutionException;
 import org.eclipse.aether.resolution.VersionRangeResult;
 import org.eclipse.aether.supplier.RepositorySystemSupplier;
+import org.eclipse.aether.transfer.TransferListener;
 import org.eclipse.aether.util.repository.AuthenticationBuilder;
-import org.slf4j.Logger;
 
-import java.io.Closeable;
-import java.io.File;
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.net.ProxySelector;
-import java.net.URI;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
+import io.kestra.core.contexts.MavenPluginRepositoryConfig;
+import io.kestra.core.exceptions.KestraRuntimeException;
+import io.kestra.core.plugins.configuration.PluginsConfiguration;
+import io.kestra.core.utils.Version;
+
+import io.micronaut.core.annotation.NonNull;
+import io.micronaut.core.annotation.Nullable;
+import jakarta.annotation.PreDestroy;
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * Service for resolving plugins from a Maven repository.
@@ -61,10 +61,10 @@ public class MavenPluginDownloader implements Closeable {
 
     @Inject
     public MavenPluginDownloader(List<MavenPluginRepositoryConfig> repositoryConfigs,
-                                 @Nullable @Value("${kestra.plugins.local-repository-path}") String localRepositoryPath) {
+        @Nullable PluginsConfiguration pluginsConfiguration) {
         this.repositoryConfigs = repositoryConfigs;
         this.system = new RepositorySystemSupplier().get();
-        this.session = repositorySystemSession(system, localRepositoryPath);
+        this.session = repositorySystemSession(system, pluginsConfiguration != null ? pluginsConfiguration.localRepositoryPath() : null);
     }
 
     /**
@@ -99,31 +99,61 @@ public class MavenPluginDownloader implements Closeable {
         }
     }
 
-
     /**
      * Resolves the given dependencies given the additional repositories.
      *
-     * @param dependency   The dependency to resolve.
+     * @param dependency The dependency to resolve.
      * @param repositories The Maven repositories.
      * @return the local {@link Path} of the resolved dependency.
      */
     public PluginArtifact resolve(String dependency, List<MavenPluginRepositoryConfig> repositories) {
+        return resolve(dependency, repositories, null);
+    }
+
+    /**
+     * Resolves the given dependencies given the additional repositories, reporting byte-level
+     * transfer progress to the provided listener.
+     *
+     * @param dependency The dependency to resolve.
+     * @param repositories The Maven repositories.
+     * @param listener optional transfer listener; {@code null} disables progress reporting.
+     * @return the resolved {@link PluginArtifact}.
+     */
+    public PluginArtifact resolve(
+        @NonNull String dependency,
+        @NonNull List<MavenPluginRepositoryConfig> repositories,
+        @Nullable TransferListener listener) {
         List<RemoteRepository> allRepositories = new ArrayList<>();
         allRepositories.addAll(buildRemoteRepositories(this.repositoryConfigs));
         allRepositories.addAll(buildRemoteRepositories(repositories));
 
-        return doResolve(allRepositories, dependency);
+        return doResolve(allRepositories, dependency, effectiveSession(listener));
     }
 
     private PluginArtifact doResolve(List<RemoteRepository> repositories, String dependency) {
-        PluginArtifact result = resolveArtifact(repositories, dependency);
+        return doResolve(repositories, dependency, this.session);
+    }
+
+    private PluginArtifact doResolve(List<RemoteRepository> repositories, String dependency, RepositorySystemSession session) {
+        PluginArtifact result = resolveArtifact(repositories, dependency, session);
         log.debug("Resolved Plugin '{}' with '{}'", dependency, result.uri());
         return result;
     }
 
+    /** Returns the base session or a shallow copy with the given listener attached. */
+    private RepositorySystemSession effectiveSession(@Nullable TransferListener listener) {
+        if (listener == null) {
+            return this.session;
+        }
+        DefaultRepositorySystemSession copy = new DefaultRepositorySystemSession(this.session);
+        copy.setTransferListener(listener);
+        return copy;
+    }
+
     public List<PluginResolutionResult> resolveVersions(final List<PluginArtifact> artifacts) {
         return artifacts.stream()
-            .map(artifact -> {
+            .map(artifact ->
+            {
                 List<String> versions = listAllVersions(artifact.toCoordinates());
 
                 final List<Version> parsedVersions = versions.stream().map(Version::of).sorted().toList();
@@ -137,9 +167,8 @@ public class MavenPluginDownloader implements Closeable {
                     return new PluginResolutionResult(artifact, Version.getLatest(parsedVersions).toString(), sortedVersions, true);
                 }
 
-                return versions.contains(artifact.version()) ?
-                    new PluginResolutionResult(artifact, artifact.version(), versions, true) :
-                    new PluginResolutionResult(artifact, null, sortedVersions, false);
+                return versions.contains(artifact.version()) ? new PluginResolutionResult(artifact, artifact.version(), versions, true)
+                    : new PluginResolutionResult(artifact, null, sortedVersions, false);
             })
             .toList();
     }
@@ -147,7 +176,8 @@ public class MavenPluginDownloader implements Closeable {
     private static List<RemoteRepository> buildRemoteRepositories(List<MavenPluginRepositoryConfig> repositoryConfigs) {
         return repositoryConfigs
             .stream()
-            .map(repositoryConfig -> {
+            .map(repositoryConfig ->
+            {
                 var build = new RemoteRepository.Builder(
                     repositoryConfig.id(),
                     DEFAULT_REPOSITORY_TYPE,
@@ -185,7 +215,8 @@ public class MavenPluginDownloader implements Closeable {
 
                 localRepositoryPath = tmpDir;
 
-                Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                Runtime.getRuntime().addShutdownHook(new Thread(() ->
+                {
                     try {
                         FileUtils.deleteDirectory(new File(tmpDir));
                     } catch (IOException e) {
@@ -203,7 +234,7 @@ public class MavenPluginDownloader implements Closeable {
         return session;
     }
 
-    private PluginArtifact resolveArtifact(List<RemoteRepository> repositories, String dependency) {
+    private PluginArtifact resolveArtifact(List<RemoteRepository> repositories, String dependency, RepositorySystemSession session) {
         try {
             DefaultArtifact artifact = new DefaultArtifact(dependency);
             VersionRangeResult version = system.resolveVersionRange(session, new VersionRangeRequest(artifact, repositories, null));
@@ -223,7 +254,7 @@ public class MavenPluginDownloader implements Closeable {
                 // Use the version from ArtifactRequest and not the one from the ArtifactResult.
                 // Otherwise, SNAPSHOT version will result in a timestamped version string.
                 highestVersion.endsWith("-SNAPSHOT") ? highestVersion : result.getArtifact().getVersion(),
-                result.getArtifact().getFile().toPath().toUri()
+                result.getArtifact().getPath().toUri()
             );
         } catch (VersionRangeResolutionException | ArtifactResolutionException e) {
             throw new KestraRuntimeException("Failed to resolve dependency: '" + dependency + "'", e);

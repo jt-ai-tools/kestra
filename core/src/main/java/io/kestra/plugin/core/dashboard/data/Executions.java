@@ -2,6 +2,7 @@ package io.kestra.plugin.core.dashboard.data;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonTypeName;
+
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.dashboards.ColumnDescriptor;
@@ -9,6 +10,7 @@ import io.kestra.core.models.dashboards.DataFilter;
 import io.kestra.core.repositories.ExecutionRepositoryInterface;
 import io.kestra.core.repositories.QueryBuilderInterface;
 import io.kestra.core.validations.ExecutionsDataFilterValidation;
+
 import io.swagger.v3.oas.annotations.media.Schema;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
@@ -50,6 +52,28 @@ import lombok.experimental.SuperBuilder;
                         total:
                           displayName: Executions
                           agg: COUNT
+                """
+        ),
+        @Example(
+            title = "Display the executions that ran for longer than ten seconds. A DURATION filter takes an ISO-8601 duration, or a number of seconds.",
+            full = true,
+            code = """
+                charts:
+                  - id: slow_executions
+                    type: io.kestra.plugin.core.dashboard.chart.Table
+                    chartOptions:
+                      displayName: Slow executions
+                    data:
+                      type: io.kestra.plugin.core.dashboard.data.Executions
+                      columns:
+                        id:
+                          field: ID
+                        duration:
+                          field: DURATION
+                      where:
+                        - field: DURATION
+                          type: GREATER_THAN
+                          value: PT10S
                 """
         )
     }

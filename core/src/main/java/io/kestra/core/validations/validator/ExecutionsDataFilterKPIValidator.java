@@ -1,26 +1,25 @@
 package io.kestra.core.validations.validator;
 
-import io.kestra.core.validations.ExecutionsDataFilterValidation;
+import java.util.ArrayList;
+import java.util.List;
+
+import io.kestra.core.validations.ExecutionsDataFilterKPIValidation;
 import io.kestra.plugin.core.dashboard.data.Executions;
 import io.kestra.plugin.core.dashboard.data.ExecutionsKPI;
+
 import io.micronaut.core.annotation.AnnotationValue;
-import io.micronaut.core.annotation.Introspected;
 import io.micronaut.core.annotation.NonNull;
 import io.micronaut.core.annotation.Nullable;
 import io.micronaut.validation.validator.constraints.ConstraintValidator;
 import io.micronaut.validation.validator.constraints.ConstraintValidatorContext;
 import jakarta.inject.Singleton;
 
-import java.util.ArrayList;
-import java.util.List;
-
 @Singleton
-@Introspected
-public class ExecutionsDataFilterKPIValidator implements ConstraintValidator<ExecutionsDataFilterValidation, ExecutionsKPI<?>> {
+public class ExecutionsDataFilterKPIValidator implements ConstraintValidator<ExecutionsDataFilterKPIValidation, ExecutionsKPI<?>> {
     @Override
     public boolean isValid(
         @Nullable ExecutionsKPI<?> executionsDataFilter,
-        @NonNull AnnotationValue<ExecutionsDataFilterValidation> annotationMetadata,
+        @NonNull AnnotationValue<ExecutionsDataFilterKPIValidation> annotationMetadata,
         @NonNull ConstraintValidatorContext context) {
         if (executionsDataFilter == null) {
             return true;
@@ -28,15 +27,18 @@ public class ExecutionsDataFilterKPIValidator implements ConstraintValidator<Exe
 
         List<String> violations = new ArrayList<>();
 
-        if (executionsDataFilter.getColumns().getField() == Executions.Fields.LABELS && executionsDataFilter.getColumns().getLabelKey() == null) {
-            violations.add("Column must have a `labelKey`.");
+        if (executionsDataFilter.getColumns().getField() == Executions.Fields.LABELS && executionsDataFilter.getColumns().getKey() == null) {
+            violations.add("Column must have a `key`.");
         }
 
-        executionsDataFilter.getNumerator().forEach(filter -> {
-            if (filter.getField() == Executions.Fields.LABELS && filter.getLabelKey() == null) {
-                violations.add("Label filters must have a `labelKey`.");
-            }
-        });
+        if (executionsDataFilter.getNumerator() != null) {
+            executionsDataFilter.getNumerator().forEach(filter ->
+            {
+                if (filter.getField() == Executions.Fields.LABELS && filter.getKey() == null) {
+                    violations.add("Label filters must have a `key`.");
+                }
+            });
+        }
 
         if (!violations.isEmpty()) {
             context.disableDefaultConstraintViolation();

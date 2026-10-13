@@ -1,97 +1,228 @@
-import path from "path";
-import {defineConfig} from "vite";
-import vue from "@vitejs/plugin-vue";
+// @ts-check
+
+import path from "path"
+import {createLogger, defineConfig, loadEnv} from "vite"
+import vue from "@vitejs/plugin-vue"
+import {federation} from "@module-federation/vite"
+
+// Silence sourcemap warnings from node_modules that are harmless:
+// - "points to a source file outside its package" (element-plus, etc.)
+// - missing .map files inside monaco-editor (marked.umd.js.map, etc.)
+const logger = createLogger()
+/**
+ * @param {string} msg
+ * @returns
+ */
+const isNodeModulesSourcemapWarning = (msg) =>
+    (/sourcemap/i).test(msg) && msg.includes("node_modules") && (
+        msg.includes("points to a source file outside its package") ||
+        msg.includes("An error occurred while trying to read the map file")
+    )
+const loggerWarn = logger.warn.bind(logger)
+/**
+ * @param {string} msg
+ * @param {any} options
+ * @returns
+ */
+logger.warn = (msg, options) => {
+    if (isNodeModulesSourcemapWarning(msg)) return
+    loggerWarn(msg, options)
+}
+const loggerWarnOnce = logger.warnOnce.bind(logger)
+/**
+ * @param {string} msg
+ * @param {any} options
+ * @returns
+ */
+logger.warnOnce = (msg, options) => {
+    if (isNodeModulesSourcemapWarning(msg)) return
+    loggerWarnOnce(msg, options)
+}
 
 import {commit} from "./plugins/commit"
-import {codecovVitePlugin} from "@codecov/vite-plugin";
+import {symlinkAlias} from "./plugins/vite-plugin-symlink-alias.mjs"
+import {stripDeadPrebuildDefault} from "./plugins/stripDeadPrebuildDefault.js"
+import {consolidateChunks} from "./plugins/consolidateChunks.js"
+import {VitePWA} from "vite-plugin-pwa"
+import {loaderFragment} from "./plugins/loaderFragment.js"
+import {pwaShortcuts} from "./plugins/pwaShortcuts"
 
-export default defineConfig({
-    base: "",
-    build: {
-        outDir: "../webserver/src/main/resources/ui",
-        rollupOptions: {
-            output: {
-                advancedChunks: {
-                    groups: [
-                        {
-                            test: /src\/components\/dashboard/i,
-                            name: "dashboard",
+export default defineConfig(({mode}) => {
+    process.env = {...process.env, ...loadEnv(mode, process.cwd())}
+
+    return {
+        base: "",
+        build: {
+            outDir: "../webserver/src/main/resources/ui",
+        },
+        server: {
+            watch: {
+                ignored: [
+                    "!**/node_modules/@kestra-io/design-system/src/**",
+                    "!**/node_modules/@kestra-io/topology/src/**",
+                ],
+            },
+            proxy: {
+                "^/api": {
+                    target: process.env.VITE_PROXY_URL || "http://localhost:8080",
+                    ws: true,
+                    changeOrigin: true,
+                },
+                // Lets @kestra-io/kestra-sdk's dev-only staleness check reach the backend's served
+                // OpenAPI spec (${context-path}/swagger/kestra.yml) to compare its hash. Dev-only;
+                // the check itself is tree-shaken from production builds.
+                "^/swagger": {
+                    target: process.env.VITE_PROXY_URL || "http://localhost:8080",
+                    changeOrigin: true,
+                },
+            },
+        },
+        resolve: {
+            preserveSymlinks: true,
+            dedupe: ["echarts", "vue-echarts", "dayjs", "vue", "vue-router", "vue-i18n", "@vueuse/core", "pinia", "@vue-flow/core", "@vue-flow/background", "@vue-flow/controls"],
+            alias: [
+                {find: "override", replacement: path.resolve(__dirname, "src/override/")},
+            ],
+        },
+        plugins: [
+            symlinkAlias(__dirname),
+            loaderFragment(),
+            vue({
+                template: {
+                    compilerOptions: {
+                        isCustomElement: (tag) => {
+                            return tag === "rapi-doc"
                         },
+                    },
+                },
+            }),
+            !process.env.STORYBOOK && federation({
+                name: "host",
+                shared: {
+                    vue: {
+                        singleton: true,
+                    },
+                },
+            }),
+            !process.env.STORYBOOK && consolidateChunks(),
+            stripDeadPrebuildDefault(),
+            commit(),
+            !process.env.STORYBOOK && VitePWA({
+                // registered manually (serviceWorker.ts) so scope derives from the runtime base path
+                injectRegister: null,
+                manifestFilename: "manifest.webmanifest",
+                includeManifestIcons: false,
+                manifest: {
+                    name: "Kestra",
+                    short_name: "Kestra",
+                    description: "Kestra - Declarative Data Orchestration Platform",
+                    start_url: "./",
+                    scope: "./",
+                    display: "standalone",
+                    theme_color: "#631bf3",
+                    background_color: "#ffffff",
+                    icons: [
+                        {src: "pwa-192x192.png", sizes: "192x192", type: "image/png", purpose: "any"},
+                        {src: "pwa-512x512.png", sizes: "512x512", type: "image/png", purpose: "any"},
+                        {src: "maskable-icon-512x512.png", sizes: "512x512", type: "image/png", purpose: "maskable"},
+                    ],
+                    shortcuts: pwaShortcuts,
+                },
+                workbox: {
+                    // shell-only precache: JS/CSS stays network-fetched (the assets/ graph is tens of MB)
+                    globPatterns: ["*.{ico,png,css}"],
+                    maximumFileSizeToCacheInBytes: 256 * 1024,
+                    // disabled: index.html carries a per-request CSRF meta (StaticFilter); a cached copy breaks CSRF
+                    navigateFallback: undefined,
+                    skipWaiting: true,
+                    clientsClaim: true,
+                    runtimeCaching: [
                         {
-                            test: /src\/components\/flows/i,
-                            name: "flows",
-                        },
-                        {
-                            test: /(shiki\/langs)|(src\/utils\/markdownDeps)/,
-                            name: "markdownDeps",
+                            urlPattern: /\/api\//,
+                            handler: "NetworkOnly",
                         },
                     ],
-                }
-            }
-        }
-    },
-    server: {
-        proxy: {
-            "^/api": {
-                target: "http://localhost:8080",
-                ws: true,
-                changeOrigin: true
-            }
-        }
-    },
-    resolve: {
-        alias: {
-            "override": path.resolve(__dirname, "src/override/"),
-            "kestra-api": path.resolve(__dirname, "src/generated/kestra-api/"),
-            "#imports": path.resolve(__dirname, "node_modules/@kestra-io/ui-libs/stub-mdc-imports.js"),
-            "#build/mdc-image-component.mjs": path.resolve(__dirname, "node_modules/@kestra-io/ui-libs/stub-mdc-imports.js"),
-            "#mdc-imports": path.resolve(__dirname, "node_modules/@kestra-io/ui-libs/stub-mdc-imports.js"),
-            "#mdc-configs": path.resolve(__dirname, "node_modules/@kestra-io/ui-libs/stub-mdc-imports.js"),
-            "@storybook/addon-actions": "storybook/actions",
-        },
-    },
-    plugins: [
-        vue({
-            template: {
-                compilerOptions: {
-                    isCustomElement: (tag) => {
-                        return tag === "rapi-doc";
-                    }
-                }
-            }
-        }),
-        commit(),
-        codecovVitePlugin({
-            enableBundleAnalysis: process.env.CODECOV_TOKEN !== undefined,
-            bundleName: "ui",
-            uploadToken: process.env.CODECOV_TOKEN,
-            telemetry: false
-        }),
-    ],
-    assetsInclude: ["**/*.md"],
-    css: {
-        devSourcemap: true,
-        preprocessorOptions: {
-            scss: {
-                silenceDeprecations: ["color-functions", "global-builtin", "if-function", "import"]
-            },
-        }
-    },
-    optimizeDeps: {
-        include: [
-            "lodash",
-            // the 3 dependencies below are used by ui-libs
-            // optimizing them allows storybook to run properly
-            // without allowing interop in typescript
-            "dayjs",
-            "debug",
-            "@braintree/sanitize-url",
-            "monaco-yaml/yaml.worker",
-            "lodash-es",
-            "nprogress"
+                },
+            }),
         ],
-        exclude: [
-            "* > @kestra-io/ui-libs"
-        ]
-    },
+        assetsInclude: ["**/*.md"],
+        customLogger: logger,
+        css: {
+            devSourcemap: true,
+            preprocessorOptions: {
+                scss: {
+                    silenceDeprecations: ["color-functions", "global-builtin", "if-function", "import"],
+                    loadPaths: [path.resolve(__dirname, "node_modules")],
+                },
+            },
+        },
+        optimizeDeps: {
+            entries: [
+                "src/**/*.stories.{ts,tsx}",
+                "tests/storybook/**/*.stories.{ts,tsx}",
+                "packages/design-system/src/**/*.{ts,vue}",
+                "!packages/design-system/src/**/*.test.ts",
+                "node_modules/@kestra-io/design-system/src/**/*.{ts,vue}",
+                "!node_modules/@kestra-io/design-system/src/**/*.test.ts",
+            ],
+            include: [
+                "debug",
+                "@braintree/sanitize-url",
+                // still pulled in by element-plus and mermaid, not by our own code
+                "lodash-es",
+                "nprogress",
+                // CJS-only packages imported as ESM defaults by unified, fault, @kestra-io/ui-libs, etc.
+                // Adding them here makes Vite pre-bundle them as ESM so Chromium (storybook) can load them.
+                "extend",
+                "format",
+                "humanize-duration",
+                "vue-gtag",
+                // Locales are lazy-loaded per language by the design system (only the active
+                // locale reaches the browser). They are listed here so Vite pre-bundles them on
+                // the FIRST optimize pass — otherwise it discovers each dynamic import at runtime
+                // and triggers a page-reloading re-optimization at startup. This does NOT ship
+                // every locale to the client; it only affects dev-server pre-bundling.
+                "dayjs/locale/de",
+                "dayjs/locale/es",
+                "dayjs/locale/fr",
+                "dayjs/locale/hi",
+                "dayjs/locale/it",
+                "dayjs/locale/ja",
+                "dayjs/locale/ko",
+                "dayjs/locale/pl",
+                "dayjs/locale/pt",
+                "dayjs/locale/pt-br",
+                "dayjs/locale/ru",
+                "dayjs/locale/zh-cn",
+                "dagre",
+                "@vue-flow/background",
+                "@vue-flow/controls",
+                "html-to-image",
+                "@module-federation/runtime",
+                // Discovered late by the federation plugin at runtime otherwise, causing a
+                // startup re-optimization + reload. Pre-bundle it in the first pass.
+                "@module-federation/dts-plugin/dynamic-remote-type-hints-plugin",
+                "js-yaml",
+                "path-browserify",
+                // Dev-only: optimizeDeps does not reach the production build, so the lazy chunk
+                // stands, but without this /setup triggers a re-optimization and a full reload.
+                "mailchecker",
+                "rapidoc",
+                // The AI Copilot stories/components import the SDK's `ai` subpath. Pre-bundle it so
+                // Vite doesn't discover it mid-run and reload the dev server — that reload kills
+                // whichever storybook test is loading at that instant (the addon-vitest setup import
+                // then fails), which is what intermittently red-flags unrelated stories in CI.
+                "@kestra-io/kestra-sdk/ai",
+            ],
+            exclude: [
+                "* > @kestra-io/ui-libs",
+                "@kestra-io/design-system",
+                "@kestra-io/topology",
+                "monaco-editor",
+                "monaco-yaml",
+                "monaco-worker-manager",
+                "monaco-marker-data-provider",
+            ],
+        },
+    }
 })

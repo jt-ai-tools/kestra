@@ -1,9 +1,8 @@
 package io.kestra.core.utils;
 
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
-
 import java.util.concurrent.ThreadFactory;
 
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 public final class ThreadMainFactoryBuilder {
 
@@ -14,7 +13,8 @@ public final class ThreadMainFactoryBuilder {
     public static ThreadFactory build(String name) {
         return new ThreadFactoryBuilder()
             .setNameFormat(name)
-            .setUncaughtExceptionHandler(ThreadUncaughtExceptionHandler.INSTANCE)
+            // a new handler per factory: it captures the KestraContext current at build time
+            .setUncaughtExceptionHandler(new ThreadUncaughtExceptionHandler())
             .build();
     }
 }

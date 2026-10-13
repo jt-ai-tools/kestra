@@ -1,21 +1,23 @@
 package io.kestra.core.runners.pebble;
 
-import com.google.common.collect.ImmutableMap;
-import io.pebbletemplates.pebble.template.EvaluationContext;
-import org.apache.commons.lang3.LocaleUtils;
-
 import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.time.format.FormatStyle;
 import java.util.*;
 
+import org.apache.commons.lang3.LocaleUtils;
+
+import com.google.common.collect.ImmutableMap;
+
+import io.pebbletemplates.pebble.template.EvaluationContext;
+
 public abstract class AbstractDate {
     public List<String> getArgumentNames() {
         return List.of("format", "timeZone", "existingFormat", "locale");
     }
 
-    private static final Map<String, DateTimeFormatter> FORMATTERS = ImmutableMap.<String, DateTimeFormatter>builder()
+    private static final Map<String, DateTimeFormatter> FORMATTERS = ImmutableMap.<String, DateTimeFormatter> builder()
         .put("iso", DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX"))
         .put("iso_milli", DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSXXX"))
         .put("iso_sec", DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssXXX"))
@@ -51,10 +53,11 @@ public abstract class AbstractDate {
 
         ZoneId zoneId = zoneId(timeZone);
         ZonedDateTime date = convert(input, zoneId, existingFormat);
+        ZoneId outputZone = timeZone != null ? zoneId : date.getZone();
 
         DateTimeFormatter formatter = formatter(format)
             .withLocale(locale)
-            .withZone(zoneId);
+            .withZone(outputZone);
 
         return formatter.format(date);
     }
@@ -102,17 +105,17 @@ public abstract class AbstractDate {
         }
 
         if (value instanceof Long longValue) {
-            if(value.toString().length() == 13) {
+            if (digitCount(longValue) == 13) {
                 return Instant.ofEpochMilli(longValue).atZone(zoneId);
-            }else if(value.toString().length() == 19 ){
-                if(value.toString().endsWith("000")){
-                    long seconds = longValue/1_000_000_000;
-                    int nanos = (int) (longValue%1_000_000_000);
-                    return Instant.ofEpochSecond(seconds,nanos).atZone(zoneId);
-                }else{
-                    long milliseconds = longValue/1_000_000;
-                    int micros = (int) (longValue%1_000_000);
-                    return  Instant.ofEpochMilli(milliseconds).atZone(zoneId).withNano(micros*1000);
+            } else if (digitCount(longValue) == 19) {
+                if (value.toString().endsWith("000")) {
+                    long seconds = longValue / 1_000_000_000;
+                    int nanos = (int) (longValue % 1_000_000_000);
+                    return Instant.ofEpochSecond(seconds, nanos).atZone(zoneId);
+                } else {
+                    long milliseconds = longValue / 1_000_000;
+                    int micros = (int) (longValue % 1_000_000);
+                    return Instant.ofEpochMilli(milliseconds).atZone(zoneId).withNano(micros * 1000);
                 }
             }
             return Instant.ofEpochSecond(longValue).atZone(zoneId);
@@ -139,5 +142,10 @@ public abstract class AbstractDate {
                 }
             }
         }
+    }
+
+    private static int digitCount(long value) {
+        int length = Long.toString(value).length();
+        return value < 0 ? length - 1 : length;
     }
 }

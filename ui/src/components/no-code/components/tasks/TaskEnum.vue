@@ -1,35 +1,56 @@
 <template>
-    <el-select
-        :modelValue="values"
+    <KsSelect
+        :modelValue="modelValue"
         @update:model-value="onInput"
         filterable
-        clearable
-        :persistent="false"
-        :placeholder="`Choose a${/^[aeiou]/i.test(root || '') ? 'n' : ''} ${root?.split('.').pop() || 'value'}`"
+        :clearable="!required"
+        :allowCreate="allowCreate"
+        :defaultFirstOption="allowCreate"
+        :placeholder="$t('no_code.choose_placeholder', {field: root?.split('.').pop() || 'value'})"
     >
-        <el-option
-            v-for="item in schema.enum"
+        <KsOption
+            v-for="item in (schema?.enum as string[])"
             :key="item"
             :label="item"
             :value="item"
         />
-    </el-select>
+    </KsSelect>
 </template>
-<script>
-    import Task from "./MixinTask";
-    export default {
-        mixins: [Task],
-    };
+
+<script setup lang="ts">
+    import {collapseEmptyValues} from "../utils/collapseEmptyValues"
+
+    type ModelValue = object | string | number | boolean | unknown[]
+
+    withDefaults(defineProps<{
+        modelValue?: ModelValue
+        schema?: Record<string, unknown>
+        required?: boolean
+        allowCreate?: boolean
+        task?: Record<string, unknown>
+        root?: string
+        definitions?: Record<string, unknown>
+    }>(), {
+        modelValue: undefined,
+        schema: undefined,
+        required: false,
+        allowCreate: false,
+        task: undefined,
+        root: undefined,
+        definitions: undefined,
+    })
+
+    const emit = defineEmits<{
+        "update:modelValue": [value: ModelValue | undefined]
+    }>()
+
+    function onInput(value: ModelValue | undefined) {
+        emit("update:modelValue", collapseEmptyValues(value))
+    }
 </script>
 
 <style scoped lang="scss">
-:deep(.el-input__inner) {
-    &::placeholder {
-        color: var(--ks-content-tertiary);
-    }
-}
-
-:deep(.el-select__suffix) {
+:deep(.kel-select__suffix) {
     display: flex !important;
 }
 </style>

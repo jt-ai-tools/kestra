@@ -1,18 +1,5 @@
 package io.kestra.plugin.core.runner;
 
-import io.kestra.core.models.annotations.Example;
-import io.kestra.core.models.annotations.Plugin;
-import io.kestra.core.models.tasks.runners.*;
-import io.kestra.core.runners.RunContext;
-import io.micronaut.core.annotation.Introspected;
-import io.swagger.v3.oas.annotations.media.Schema;
-import lombok.EqualsAndHashCode;
-import lombok.Getter;
-import lombok.NoArgsConstructor;
-import lombok.ToString;
-import lombok.experimental.SuperBuilder;
-import org.slf4j.Logger;
-
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -21,7 +8,20 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-@Introspected
+import org.slf4j.Logger;
+
+import io.kestra.core.models.annotations.Example;
+import io.kestra.core.models.annotations.Plugin;
+import io.kestra.core.models.tasks.runners.*;
+import io.kestra.core.runners.RunContext;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.ToString;
+import lombok.experimental.SuperBuilder;
+
 @SuperBuilder
 @ToString
 @EqualsAndHashCode
@@ -30,9 +30,11 @@ import java.util.Map;
 @Schema(
     title = "Run tasks as local subprocesses on the worker.",
     description = """
-        Executes task commands with the host OS process APIs. Working directory is exposed via `{{workingDir}}` expression / `WORKING_DIR` environment variables; if `outputFiles` are configured, write them to the same directory or use `{{outputDir}}` / `OUTPUT_DIR` when enabled. Input files and namespace files will be available in this directory.
+        Executes task commands using the host OS process APIs. The working directory is exposed as the `{{workingDir}}` template variable and the `WORKING_DIR` environment variable; input files and namespace files are materialized there before execution, and `outputFiles` must be written there to be captured.
 
-        Platform-agnostic (Linux/macOS/Windows). If the worker stops, the process is interrupted and will be recreated on restart."""
+        When a task enables output directory support, the `{{outputDir}}` template variable and `OUTPUT_DIR` environment variable are also available as a dedicated location for output files — this is a separate mechanism from `outputFiles`.
+
+        Platform-agnostic (Linux/macOS/Windows). If the worker is interrupted, the process and all its descendants are killed. Kestra will re-queue the task execution when the worker restarts."""
 )
 @Plugin(
     examples = {
@@ -133,13 +135,14 @@ public class Process extends TaskRunner<TaskRunnerDetailResult> {
 
         java.lang.Process process = processBuilder.start();
         long pid = process.pid();
-        logger.debug("Starting command with pid {} [{}]", pid, String.join(" ", renderedCommands));
+        if (logger.isDebugEnabled()) {
+            logger.debug("Starting command with pid {} [{}]", pid, TaskLogLineMatcher.redactEncryptedOutputs(String.join(" ", renderedCommands)));
+        }
 
         LogRunnable stdOutRunnable = new LogRunnable(process.getInputStream(), defaultLogConsumer, false);
         LogRunnable stdErrRunnable = new LogRunnable(process.getErrorStream(), defaultLogConsumer, true);
         Thread stdOut = Thread.startVirtualThread(stdOutRunnable);
         Thread stdErr = Thread.startVirtualThread(stdErrRunnable);
-
 
         try {
             int exitCode = process.waitFor();
@@ -178,7 +181,8 @@ public class Process extends TaskRunner<TaskRunnerDetailResult> {
     }
 
     private void killDescendantsOf(ProcessHandle process, Logger logger) {
-        process.descendants().forEach(processHandle -> {
+        process.descendants().forEach(processHandle ->
+        {
             if (!processHandle.destroy()) {
                 logger.warn("Descendant process {} of {} couldn't be killed", processHandle.pid(), process.pid());
             }

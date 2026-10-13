@@ -1,11 +1,10 @@
 package io.kestra.core.exceptions;
 
-import java.io.Serial;
-
 /**
  * Exception thrown when a task runner is killed during execution.
  */
 public class KilledException extends KestraRuntimeException {
+    private static final long serialVersionUID = 1L;
     private static final String DEFAULT_MESSAGE = "Execution was killed.";
 
     /**

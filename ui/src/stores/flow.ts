@@ -1,44 +1,50 @@
-import {computed, h, ref, watch} from "vue";
-import {ElMessageBox} from "element-plus";
-import permission from "../models/permission";
-import action from "../models/action";
-import * as YAML_UTILS from "@kestra-io/ui-libs/flow-yaml-utils";
-import Utils from "../utils/utils";
-import {apiUrl} from "override/utils/route";
-import {useCoreStore} from "./core";
-import {useUnsavedChangesStore} from "./unsavedChanges";
-import {defineStore} from "pinia";
-import {FlowGraph} from "@kestra-io/ui-libs/vue-flow-utils";
-import {makeToast} from "../utils/toast";
-import {InputType} from "../utils/inputs";
-import {globalI18n} from "../translations/i18n";
-import {transformResponse} from "../components/dependencies/composables/useDependencies";
-import {useAuthStore} from "override/stores/auth";
-import {useRoute} from "vue-router";
-import {useAxios} from "../utils/axios";
-import {defaultNamespace} from "../composables/useNamespaces";
-import {TUTORIAL_NAMESPACE} from "../utils/constants";
-import Markdown from "../components/layout/Markdown.vue"
+import {computed, h, ref, watch} from "vue"
+import {KsMarkdown, KsMessageBox} from "@kestra-io/design-system"
+import {routeQueryToQueryFilters} from "../utils/queryFilters"
+import resource from "../models/resource"
+import action from "../models/action"
+import * as YAML_UTILS from "@kestra-io/topology/flow-yaml-utils"
+import {useCoreStore} from "./core"
+import {useUnsavedChangesStore} from "./unsavedChanges"
+import {defineStore} from "pinia"
+import type {FlowGraph} from "@kestra-io/topology/vue-flow-utils"
+import {makeToast} from "../utils/toast"
+import {InputType} from "../utils/inputs"
+import {globalI18n} from "../translations/i18n"
+import {transformResponse} from "../components/dependencies/utils/transform"
+import {useAuthStore} from "override/stores/auth"
+import {useRoute} from "vue-router"
+import type {
+    AbstractTrigger,
+    FlowWithSource,
+    PagedResultsFlow,
+    SourceSearchResult,
+    SourceSearchScope,
+    Task as SdkTask,
+} from "@kestra-io/kestra-sdk"
+import {asProblem, isProblemType, ProblemTypes} from "@kestra-io/kestra-sdk"
+import * as FlowsAPI from "@kestra-io/kestra-sdk/flows"
+import * as MetricsAPI from "@kestra-io/kestra-sdk/metrics"
+import {defaultNamespace} from "../composables/useNamespaces"
+import {useApiStore} from "./api"
+import {flowTaskStats, isExampleFlow, primaryTriggerType} from "../utils/analytics/activation"
+import type {KestraHttpError, KestraRequestOptions} from "../utils/kestraHttp"
+import {validationErrorLines, type ValidationError} from "../utils/validationErrors"
 
 const textYamlHeader = {
     headers: {
-        "Content-Type": "application/x-yaml"
-    }
+        "Content-Type": "application/x-yaml",
+    },
 }
 
-const VALIDATE = {validateStatus: (status: number) => status === 200 || status === 401};
-
-interface Trigger {
-    id: string;
-    type: string;
+export type Trigger = AbstractTrigger & {
     backfill?: {
         start?: string;
     };
+    key?: string;
 }
 
-export interface Task {
-    id: string,
-    type: string
+export type Task = SdkTask & {
     tasks?: Task[]
 }
 
@@ -46,218 +52,316 @@ export interface Input {
     id: string;
     type: InputType;
     required?: boolean;
-    defaults?: any;
+    defaults?: unknown;
 }
 
-interface FlowValidations {
-    constraints?: string;
+export interface FlowValidations {
     outdated?: boolean;
     infos?: string[];
     warnings?: string[];
     deprecationPaths?: string[];
+    errors?: ValidationError[];
 }
 
-export interface Flow {
-    id: string;
-    namespace: string;
+export type Flow = Omit<FlowWithSource, "disabled" | "draft" | "deleted" | "tasks"> & {
     source: string;
-    revision?: number;
-    deleted?: boolean;
     disabled?: boolean;
-    labels?: Record<string, string | boolean>;
+    draft?: boolean;
+    deleted?: boolean;
     triggers?: Trigger[];
     inputs?: Input[];
-    errors?: { message: string; code?: string, id?: string }[];
-    concurrency?: {
-        limit: number;
-        behavior: string;
-    };
+    errors?: Task[];
     tasks?: Task[];
 }
+
+/** A flow as parsed from YAML the user is editing, so any key may be missing or extra. */
+export type ParsedFlow = Partial<Flow> & Record<string, unknown>
+
+/**
+ * A route query only whose `filters[...]` keys reach the backend as filters, plus the paging and
+ * commit options `findFlows` reads off the same bag.
+ */
+type FlowSearchOptions = Record<string, unknown> & {
+    page?: number;
+    size?: number;
+    sort?: string;
+    /** `false` returns the page without replacing the store's `flows`/`total`. */
+    commit?: boolean;
+    onlyTotal?: boolean;
+}
+
+/**
+ * The source-code search query, with `sort` as the single key the store wraps into an array.
+ * Spelled out rather than derived from `typeof FlowsAPI.searchFlowsBySourceCode`: deriving it puts
+ * this module's own `@kestra-io/kestra-sdk/flows` instance into the store's exported types, and EE
+ * — which imports this store and has its own SDK build — then resolves its SDK to OSS's copy and
+ * loses every EE-only endpoint.
+ */
+type SourceSearchOptions = {
+    page?: number;
+    size?: number;
+    sort?: string;
+    q?: string | null;
+    namespace?: string | null;
+    caseSensitive?: boolean;
+    wholeWord?: boolean;
+    regex?: boolean;
+    scope?: SourceSearchScope;
+    tenant?: string;
+}
+
+/**
+ * A flow revision as `listFlowRevisions` returns it: same shape as any flow, except that `revision`
+ * is always filled - it is what the list is keyed on - where `FlowWithSource` leaves it optional.
+ */
+export type FlowRevision = FlowWithSource & {revision: number}
+
+/** `subflows` lists the subflow paths whose own graph is expanded inline. */
+type GraphSubflows = {params?: {subflows?: string | string[]}}
 
 export type FlowSaveOutcome =
     | "saved"
     | "redirect_to_update"
-    | "confirmOutdatedSaveDialog"
     | "blocked"
     | "no_op";
 
 export function isSuccessfulFlowSaveOutcome(
     outcome: FlowSaveOutcome | null | undefined,
 ): outcome is "saved" | "redirect_to_update" {
-    return outcome === "saved" || outcome === "redirect_to_update";
+    return outcome === "saved" || outcome === "redirect_to_update"
 }
 
 export const useFlowStore = defineStore("flow", () => {
     const flows = ref<Flow[]>()
     const flow = ref<Flow>()
-    const task = ref<Task>()
-    const search = ref<any[]>()
+    const search = ref<SourceSearchResult[]>()
     const total = ref<number>(0)
-    const overallTotal = ref<number>()
     const flowGraph = ref<FlowGraph>()
     const invalidGraph = ref<boolean>(false)
-    const revisions = ref<any[]>()
+    const revisions = ref<FlowRevision[]>()
+    const revisionsCount = ref<number>()
+    const dependenciesCount = ref<number>()
+    const filesSaveAll = ref<(() => Promise<void>) | null>(null)
+    const hasDirtyEditorFiles = ref<boolean>(false)
     const flowValidation = ref<FlowValidations>()
-    const taskError = ref<string>()
-    const metrics = ref<any[]>()
-    const aggregatedMetrics = ref<any>()
-    const tasksWithMetrics = ref<any[]>()
+    const taskErrors = ref<ValidationError[]>()
+    const metrics = ref<string[]>()
+    const tasksWithMetrics = ref<string[]>()
     const executeFlow = ref<boolean>(false)
-    const openAiCopilot = ref<boolean>(false)
-    const lastSaveFlow = ref<string>()
     const isCreating = ref<boolean>(false)
+    const readonlyToastShown = ref(false)
     const flowYaml = ref<string>("")
     const flowYamlOrigin = ref<string>("")
-    const confirmOutdatedSaveDialog = ref<boolean>(false)
+    const previewSource = ref<string | undefined>(undefined)
+    /** Registered by `CopilotChat.vue` (mirrors `filesSaveAll`'s pattern) so `FlowFileEditorTab.vue`'s
+     *  read-only-preview banner can decline the active `previewSource` without depending on the AI
+     *  dock's internal state directly. */
+    const declinePreview = ref<(() => void) | null>(null)
     const expandedSubflows = ref<string[]>([])
-    const metadata = ref<Record<string, any>>()
-    const creationId = ref<string>();
+    const creationId = ref<string>()
 
-    const axios = useAxios();
+    const coreStore = useCoreStore()
+    const unsavedChangesStore = useUnsavedChangesStore()
 
-    const coreStore = useCoreStore();
-    const unsavedChangesStore = useUnsavedChangesStore();
-
-    const t = (key: string, values?: Record<string, any>) => {
+    const t = (key: string, values?: Record<string, unknown>) => {
         if (!globalI18n.value) {
-            return key;
+            return key
         }
-        return (values ? globalI18n.value?.t(key, values) : globalI18n.value?.t(key)) ?? key;
-    };
-
-    function onSaveMetadata() {
-        flowYaml.value = YAML_UTILS.updateMetadata(flowYaml.value ?? "", metadata.value ?? {});
-        metadata.value = undefined;
+        return (values ? globalI18n.value?.t(key, values) : globalI18n.value?.t(key)) ?? key
     }
 
-    const haveChange = computed(() => flowYamlOrigin.value !== flowYaml.value);
+    const haveChange = computed(() => flowYamlOrigin.value !== flowYaml.value)
 
     watch(haveChange, (newValue) => {
-        unsavedChangesStore.unsavedChange = newValue;
-    });
+        unsavedChangesStore.unsavedChange = newValue
+    })
 
-    async function saveAll(): Promise<FlowSaveOutcome> {
-        if ((!haveChange.value && !isCreating.value) || flowErrors.value?.length) {
-            return (!haveChange.value && !isCreating.value) ? "no_op" : "blocked";
+    async function saveAll(draft?: boolean): Promise<FlowSaveOutcome> {
+        const isDraft = draft ?? flow.value?.draft ?? false
+
+        if (!haveChange.value && !isCreating.value) {
+            return "no_op"
         }
 
-        if (!flow.value) return "blocked";
-        const source = flowYaml.value;
-        const outcome = await saveWithoutRevisionGuard();
+        if (!flow.value) return "blocked"
+        const source = flowYaml.value
+        const validation = await onEdit({source})
+        if (validation?.outdated && !isCreating.value && !(await confirmOutdatedSave())) {
+            return "no_op"
+        }
+        const outcome = await saveWithoutRevisionGuard(isDraft)
         if (isSuccessfulFlowSaveOutcome(outcome)) {
-            flowYamlOrigin.value = source;
+            flowYamlOrigin.value = source
         }
-        return outcome;
+        return outcome
     }
 
-    const route = useRoute();
+    function confirmOutdatedSave(): Promise<boolean> {
+        const key = "outdated revision save confirmation.update"
+        return KsMessageBox({
+            title: t(`${key}.title`),
+            message: () => h("div", null, [
+                h("p", null, `${t(`${key}.description`)} ${t(`${key}.details`)}`),
+            ]),
+            showCancelButton: true,
+            confirmButtonText: t("ok"),
+            cancelButtonText: t("cancel"),
+            center: false,
+            showClose: false,
+        }).then(() => true).catch(() => false)
+    }
+
+    async function saveAsDraft(): Promise<FlowSaveOutcome> {
+        return saveAll(true)
+    }
+
+    const route = useRoute()
 
     const getNamespace = () => {
-        return route.query.namespace || defaultNamespace();
+        return route?.query?.namespace || defaultNamespace()
     }
 
-    async function save(): Promise<FlowSaveOutcome> {
-        if (flowErrors.value?.length) {
-            return "blocked";
-        }
-
-        const source = flowYaml.value;
+    async function save(draft: boolean = false): Promise<FlowSaveOutcome> {
+        const source = flowYaml.value
 
         if (source) {
-            const validation = await onEdit({source});
-            if (validation?.outdated && !isCreating.value) {
-                return "confirmOutdatedSaveDialog";
+            const validation = await onEdit({source})
+            if (validation?.outdated && !isCreating.value && !(await confirmOutdatedSave())) {
+                return "no_op"
             }
-            const outcome = await saveWithoutRevisionGuard();
+            const outcome = await saveWithoutRevisionGuard(draft)
             if (isSuccessfulFlowSaveOutcome(outcome)) {
-                flowYamlOrigin.value = source;
+                flowYamlOrigin.value = source
             }
 
-            return outcome;
+            return outcome
         }
 
-        return "no_op";
+        return "no_op"
     }
 
-    async function onEdit({source, topologyVisible}: {
+    async function publishDraft(target?: Flow): Promise<FlowSaveOutcome> {
+        if (target) {
+            const data = await loadFlow({namespace: target.namespace, id: target.id, store: false})
+            if (!data?.source) return "blocked"
+            await saveFlow({flow: data.source, draft: false})
+            notifySaved(data.id, false)
+            return "saved"
+        }
+        if (!flowYaml.value && flow.value?.source) {
+            flowYaml.value = flow.value.source
+        }
+        return save(false)
+    }
+
+    async function onEdit({source, topologyVisible, metadataGuarded}: {
         source: string,
         editorViewType?: string,
-        topologyVisible?: boolean
+        topologyVisible?: boolean,
+        /**
+         * Set by an editor that already prevents id/namespace from being edited.
+         * There the warning would explain a change the user was never able to
+         * make; every other caller still needs it.
+         */
+        metadataGuarded?: boolean
     }): Promise<FlowValidations | undefined> {
-        const flowBeforeEdit = flow.value;
-        const flowOnValidation = flowParsed.value;
+        const flowBeforeEdit = flow.value
+        const flowOnValidation = flowParsed.value
 
         if (!source.trim()?.length) {
             flowValidation.value = {
-                constraints: t("flow must not be empty")
-            };
+                errors: [{detail: t("flow must not be empty")}],
+            }
             return
         }
         if (!isCreating.value) {
             try{
-                if (flowBeforeEdit &&
+                if (flowBeforeEdit && flowOnValidation &&
                         (flowOnValidation.id !== flowBeforeEdit.id ||
                             flowOnValidation.namespace !== flowBeforeEdit.namespace)) {
 
-                    coreStore.message = {
-                        variant: "error",
-                        title: t("readonly property"),
-                        message: t("namespace and id readonly"),
-                    };
+                    if (!metadataGuarded && !readonlyToastShown.value) {
+                        readonlyToastShown.value = true
+                        coreStore.message = {
+                            variant: "warning",
+                            title: t("readonly property"),
+                            content: t("namespace and id readonly"),
+                        }
+                    }
                     flowYaml.value = YAML_UTILS.replaceIdAndNamespace(
                         source,
                         flowBeforeEdit.id,
-                        flowBeforeEdit.namespace
-                    );
+                        flowBeforeEdit.namespace,
+                    )
                 }
             } catch{
-                // yaml is not always valid
             }
         }
 
         return validateFlow({
-            flow: (isCreating.value ? flowYaml.value : yamlWithNextRevision.value) ?? ""
+            flow: (isCreating.value ? flowYaml.value : yamlWithNextRevision.value) ?? "",
         })
             .then((value: FlowValidations) => {
                 if (
                     topologyVisible &&
                     flowHaveTasks.value &&
-                    // avoid sending empty errors
-                    // they make the backend fail
                     flowBeforeEdit && (!flowBeforeEdit.errors || flowBeforeEdit.errors.every(e => typeof e.id === "string"))
                 ) {
-                    if (!value.constraints) fetchGraph();
+                    if (!value.errors?.length) fetchGraph()
                 }
 
-                return value;
-            });
+                return value
+            })
     }
 
-    const toast = makeToast(t);
+    const toast = makeToast(t)
 
-    async function saveWithoutRevisionGuard(): Promise<FlowSaveOutcome> {
-        const flowSource = flowYaml.value ?? "";
+    function notifySaved(name: string, draft: boolean) {
+        if (draft) {
+            toast.success(
+                t("saved as draft done", {name}),
+                t("saved as draft"),
+            )
+        } else {
+            toast.saved(name)
+        }
+    }
 
-        if (flowParsed.value === undefined) {
+    let inFlightSave: Promise<FlowSaveOutcome> | null = null
+
+    async function saveWithoutRevisionGuard(draft: boolean = false): Promise<FlowSaveOutcome> {
+        if (inFlightSave) return inFlightSave
+        if (!isCreating.value && !haveChange.value) return "no_op"
+        inFlightSave = performSave(draft)
+        try {
+            return await inFlightSave
+        } finally {
+            inFlightSave = null
+        }
+    }
+
+    async function performSave(draft: boolean = false): Promise<FlowSaveOutcome> {
+        const flowSource = flowYaml.value ?? ""
+
+        if (flowParsed.value === undefined && !draft) {
             coreStore.message = {
                 variant: "error",
                 title: t("invalid flow"),
-                message: t("invalid yaml"),
-            };
+                content: t("invalid yaml"),
+            }
 
-            return "blocked";
+            return "blocked"
         }
 
-        let overrideFlow = false;
+        let overrideFlow = false
         if (flowErrors.value) {
             if (flowValidation.value?.outdated && isCreating.value) {
-                overrideFlow = await ElMessageBox({
+                overrideFlow = await KsMessageBox({
                     title: t("override.title"),
                     message: () => {
                         return h("div", null, [
                             h("p", null, t("override.details")),
-                        ]);
+                        ])
                     },
                     showCancelButton: true,
                     confirmButtonText: t("ok"),
@@ -266,64 +370,63 @@ export const useFlowStore = defineStore("flow", () => {
                     showClose: false,
                 })
                     .then(() => {
-                        overrideFlow = true;
-                        return true;
+                        overrideFlow = true
+                        return true
                     })
                     .catch(() => {
-                        return false;
-                    });
+                        return false
+                    })
             }
         }
 
-        const isCreatingBackup = isCreating.value;
+        const isCreatingBackup = isCreating.value
         if (isCreating.value && !overrideFlow) {
             try {
-                const response = await createFlow({flow: flowSource ?? ""});
-                toast.saved(response.id);
-                isCreating.value = false;
-            } catch (error: any) {
-                if (error?.response?.status === 422 && error?.response?.data?.message?.includes("Flow id already exists")) {
-                    const shouldRedirect = await ElMessageBox({
+                const response = await createFlow({flow: flowSource ?? "", draft})
+                notifySaved(response.id, draft)
+                isCreating.value = false
+            } catch (error: unknown) {
+                // Branch on the problem type alone. The status is deliberately not checked, so this keeps
+                // working if the type's status is ever revised.
+                if (isProblemType(error, ProblemTypes.ENTITY_ALREADY_EXISTS)) {
+                    const shouldRedirect = await KsMessageBox({
                         title: t("confirmation"),
-                        message: () => h(Markdown, {source: t("flow already exists message", {id: flowParsed.value.id, namespace: flowParsed.value.namespace})}),
+                        message: () => h(KsMarkdown, {content: t("flow already exists message", {id: flowParsed.value?.id ?? "", namespace: flowParsed.value?.namespace ?? ""})}),
                         type: "warning",
                         showCancelButton: true,
                     }).then(async () => {
-                        const response = await saveFlow({flow: flowSource});
-                        toast.saved(response.id);
-                        isCreating.value = false;
-                        return true;
+                        const response = await saveFlow({flow: flowSource, draft})
+                        notifySaved(response.id, draft)
+                        isCreating.value = false
+                        return true
                     })
 
-                    return shouldRedirect ? "redirect_to_update" : "blocked";
+                    return shouldRedirect ? "redirect_to_update" : "blocked"
                 }
 
-                if (error.response?.data) {
-                    coreStore.message = {
-                        variant: "error",
-                        response: error.response,
-                        content: error.response.data
-                    }
+                const problem = asProblem(error)
+                if (problem) {
+                    coreStore.message = {variant: "error", problem, status: problem.status}
                 }
-                
-                throw error;
+
+                throw error
             }
         } else {
-            await saveFlow({flow: flowSource})
+            await saveFlow({flow: flowSource, draft})
                 .then((response: Flow) => {
-                    toast.saved(response.id);
-                });
+                    notifySaved(response.id, draft)
+                })
         }
 
         if (isCreatingBackup || overrideFlow) {
-            return "redirect_to_update";
+            return "redirect_to_update"
         }
 
         await validateFlow({
-            flow: (isCreatingBackup ? flowSource : yamlWithNextRevision.value) ?? ""
-        });
+            flow: (isCreatingBackup ? flowSource : yamlWithNextRevision.value) ?? "",
+        })
 
-        return "saved";
+        return "saved"
     }
 
     function fetchGraph() {
@@ -331,496 +434,515 @@ export const useFlowStore = defineStore("flow", () => {
             flow: flowYaml.value ?? "",
             config: {
                 params: {
-                    // due to usage of axios instance instead of $http which doesn't convert arrays
                     subflows: expandedSubflows.value.join(","),
                 },
-                validateStatus: (status: number) => {
-                    return status === 200;
-                },
             },
-        });
+        })
     }
 
     async function initYamlSource() {
-        if (!flow.value) return;
-        const {source} = flow.value;
-        flowYaml.value = source;
-        flowYamlOrigin.value = source;
+        if (!flow.value) return
+        const {source} = flow.value
+        flowYaml.value = source
+        flowYamlOrigin.value = source
         if (flowHaveTasks.value) {
-            fetchGraph();
+            fetchGraph()
         }
 
-        // validate flow on first load
         return validateFlow({flow: isCreating.value ? source : yamlWithNextRevision.value})
     }
 
-    function findFlows(options: { [key: string]: any }) {
-        const sortString = options.sort ? `?sort=${options.sort}` : ""
-        delete options.sort
-        return axios.get(`${apiUrl()}/flows/search${sortString}`, {
-            params: options
-        }).then(response => {
+    function toFlowSearchParams(options: FlowSearchOptions) {
+        return {
+            page: options.page,
+            size: options.size,
+            sort: options.sort ? [options.sort] : undefined,
+            filters: routeQueryToQueryFilters(options),
+        }
+    }
+
+    /** With `onlyTotal`, resolves to the number of matches instead of the page of results. */
+    function findFlows(options: FlowSearchOptions & { onlyTotal: true }): Promise<number>
+    function findFlows(options: FlowSearchOptions): Promise<PagedResultsFlow>
+    function findFlows(options: FlowSearchOptions): Promise<PagedResultsFlow | number> {
+        return FlowsAPI.searchFlows(toFlowSearchParams(options)).then(response => {
             if (options.onlyTotal) {
-                return response.data.total;
+                return response.total
             }
 
             else {
-                flows.value = response.data.results
-                total.value = response.data.total
-                overallTotal.value = response.data.results.filter((f: any) => f.namespace !== TUTORIAL_NAMESPACE).length
+                if (options.commit !== false) {
+                    flows.value = response.results as unknown as Flow[]
+                    total.value = response.total ?? 0
+                }
 
-                return response.data;
+                return response
             }
         })
     }
-    function searchFlows(options: { [key: string]: any }) {
-        const sortString = options.sort ? `?sort=${options.sort}` : ""
-        delete options.sort
-        return axios.get(`${apiUrl()}/flows/source${sortString}`, {
-            params: options
-        }).then(response => {
-            search.value = response.data.results
-            total.value = response.data.total
+    function searchFlows(options: SourceSearchOptions) {
+        const {sort, ...rest} = options
+        return FlowsAPI.searchFlowsBySourceCode({...rest, sort: sort ? [sort] : undefined}).then(response => {
+            search.value = response.results
+            total.value = response.total ?? 0
 
-            return response.data;
+            return response
         })
     }
 
     function flowsByNamespace(namespace: string) {
-        return axios.get(`${apiUrl()}/flows/${namespace}`).then(response => {
-            return response.data;
+        return FlowsAPI.listFlowsByNamespace({namespace}).then(response => {
+            return response
         })
     }
 
-    async function loadFlow(options: { namespace: string, id: string, revision?: string, allowDeleted?: boolean, source?: boolean, store?: boolean, deleted?: boolean, httpClient?: any }) {
-        const httpClient = options.httpClient ?? axios
-        const response: {data:Flow & {exception?: string}} = await httpClient.get(`${apiUrl()}/flows/${options.namespace}/${options.id}`,
-            {
-                params: {
-                    revision: options.revision,
-                    allowDeleted: options.allowDeleted,
-                    source: options.source === undefined ? true : undefined
-                },
-                validateStatus: (status: number) => {
-                    return options.deleted ? status === 200 || status === 404 : status === 200;
-                }
-            })
+    // Tracks the flow the user is currently navigating to, so a load for a flow they have since
+    // moved away from can be dropped without an unrelated caller's own load for the *same* flow
+    // (e.g. Topology.vue re-syncing in the background) being able to drop it too (#10722).
+    let latestFlowLoadKey: string | undefined
 
-        if (response.data.exception) {
+    async function loadFlow(
+        options: { namespace: string, id: string, revision?: string, allowDeleted?: boolean, source?: boolean, store?: boolean, deleted?: boolean },
+        requestOptions?: KestraRequestOptions,
+    ) {
+        const key = `${options.namespace}/${options.id}`
+        if (options.store !== false) {
+            latestFlowLoadKey = key
+        }
+        let data: Flow & {exception?: string}
+        try {
+            data = await FlowsAPI.flow({
+                namespace: options.namespace,
+                id: options.id,
+                revision: options.revision ? Number(options.revision) : undefined,
+                allowDeleted: options.allowDeleted,
+                source: true,
+            }, requestOptions) as Flow & {exception?: string}
+        } catch (e) {
+            // A deleted flow answers 404 with a problem document rather than the flow, and the one
+            // caller (subflow-input autocompletion) only reads `inputs`, so an empty flow stands in.
+            if (options.deleted && (e as KestraHttpError).status === 404) {
+                return {} as Flow & {exception?: string}
+            }
+            throw e
+        }
+
+        // A load for a flow the user has navigated away from must not become the flow on screen,
+        // the same way a superseded search is dropped in `stores/logs.ts`.
+        if (options.store === false || key !== latestFlowLoadKey) {
+            return data
+        }
+
+        // The previous flow's pointers would resolve against this source, squiggling the wrong lines.
+        flowValidation.value = undefined
+
+        if (data.exception) {
             coreStore.message = {
-                title: "Invalid source code",
-                message: response.data.exception,
-                variant: "error"
-            };
+                title: t("invalid_source_code"),
+                content: data.exception,
+                variant: "error",
+            }
 
-            // add this error to the list of errors
             flowValidation.value = {
-                constraints: response.data.exception,
+                errors: [{detail: data.exception}],
                 outdated: false,
-                infos: []
-            };
-            delete response.data.exception;
+                infos: [],
+            }
+            delete data.exception
         }
 
         validateFlow({
-            flow: `revision: ${(response.data.revision ?? 0) + 1}\n${response.data.source}`
-        });
+            flow: `revision: ${(data.revision ?? 0) + 1}\n${data.source}`,
+        })
 
-        if (options.store === false) {
-            return response.data;
-        }
+        flow.value = data
+        flowYaml.value = data.source
+        flowYamlOrigin.value = data.source
+        previewSource.value = undefined
+        readonlyToastShown.value = false
 
-        flow.value = response.data;
-        flowYaml.value = response.data.source;
-        flowYamlOrigin.value = response.data.source;
-        overallTotal.value = 1;
-
-        return response.data;
-        
+        return data
     }
     function loadTask(options: { namespace: string, id: string, taskId: string, revision?: string }) {
-        return axios.get(
-            `${apiUrl()}/flows/${options.namespace}/${options.id}/tasks/${options.taskId}${options.revision ? "?revision=" + options.revision : ""}`,
-            {
-                validateStatus: (status: number) => {
-                    return status === 200 || status === 404;
-                }
-            }
-        )
-            .then(response => {
-                if (response.status === 200) {
-                    task.value = response.data;
-
-                    return response.data;
-                } else {
-                    return null;
-                }
-            })
-    }
-    function saveFlow(options: { flow: string }) {
-        const flowData = YAML_UTILS.parse(options.flow)
-        return axios.put(`${apiUrl()}/flows/${flowData.namespace}/${flowData.id}`, options.flow, {
-            ...textYamlHeader,
-            ...VALIDATE
+        return FlowsAPI.taskFromFlow({
+            namespace: options.namespace,
+            id: options.id,
+            taskId: options.taskId,
+            revision: options.revision ? Number(options.revision) : undefined,
         })
-            .then(response => {
-                if (response.status >= 300) {
-                    return Promise.reject(response)
-                } else {
-                    flow.value = response.data;
-
-                    return response.data;
-                }
+            .then(data => {
+                return data
+            })
+            .catch((e: KestraHttpError) => {
+                if (e.status === 404) return null
+                throw e
             })
     }
-    function updateFlowTask(options: { flow: Flow, task: Task }) {
-        return axios
-            .patch(`${apiUrl()}/flows/${options.flow.namespace}/${options.flow.id}/${options.task.id}`, options.task).then(response => {
-                flow.value = response.data;
+    function saveFlow(options: { flow: string, draft?: boolean }) {
+        let namespace: string
+        let id: string
+        try {
+            const flowData = YAML_UTILS.parse<ParsedFlow>(options.flow)
+            namespace = flowData?.namespace ?? flow.value?.namespace ?? ""
+            id = flowData?.id ?? flow.value?.id ?? ""
+        } catch {
+            namespace = flow.value?.namespace ?? ""
+            id = flow.value?.id ?? ""
+        }
+        return FlowsAPI.updateFlow({
+            namespace,
+            id,
+            body: options.flow,
+            draft: options.draft ?? false,
+        }).then(data => {
+            flow.value = data as Flow
 
-                return response.data;
-            })
-            .then(flow => {
-                loadGraph({flow});
-
-                return flow;
-            })
+            return flow.value
+        })
     }
 
-    function createFlow(options: { flow: string }) {
-        return axios.post(`${apiUrl()}/flows`, options.flow, {
-            ...textYamlHeader,
-            ...VALIDATE,
-            showMessageOnError: false
-        }).then(response => {
-            if (response.status >= 300) {
-                return Promise.reject(response)
+    function createFlow(options: { flow: string, draft?: boolean, restore?: boolean }) {
+        return FlowsAPI.createFlow({
+            body: options.flow,
+            draft: options.draft ?? false,
+            showMessageOnError: false,
+        } as Parameters<typeof FlowsAPI.createFlow>[0]).then(data => {
+            const creationPanels = localStorage.getItem(`el-fl-creation-${creationId.value}`) ?? YAML_UTILS.stringify([])
+            localStorage.setItem(`el-fl-${flow.value!.namespace}-${flow.value!.id}`, creationPanels)
+
+            flow.value = data as Flow
+
+            localStorage.removeItem(`el-fl-creation-${creationId.value}`)
+            creationId.value = undefined
+
+            trackFlowCreated(flow.value, options.restore === true, options.draft === true)
+
+            return flow.value
+        })
+    }
+
+    // Only on creation: saveFlow() fires on every editor save, which would drown the signal.
+    // restoreFlow() also goes through createFlow(), on a flow_id that already reported a creation -
+    // flagged rather than dropped so activation can exclude it downstream.
+    function trackFlowCreated(created: Flow, isRestore: boolean, isDraft: boolean) {
+        const {taskCount, pluginCount} = flowTaskStats(created.tasks)
+
+        useApiStore().posthogEvents({
+            type: "FLOW_CREATED",
+            namespace: created.namespace,
+            flow_id: created.id,
+            task_count: taskCount,
+            plugin_count: pluginCount,
+            trigger_type: primaryTriggerType(created.triggers),
+            is_example: isExampleFlow(created.namespace),
+            is_restore: isRestore,
+            is_draft: isDraft,
+        })
+    }
+
+    // The editor wants this count twice - tab badge and toolbar stat - so they share one request.
+    const inFlightDependencyCounts = new Map<string, ReturnType<typeof requestDependencies>>()
+
+    function requestDependencies(options: { namespace: string, id: string, subtype: "FLOW" | "EXECUTION" }, onlyCount: boolean) {
+        return FlowsAPI.flowDependencies({namespace: options.namespace, id: options.id, expandAll: !onlyCount}).then(data => {
+            const totalNodes = data.nodes ? new Set(data.nodes.map((r:{uid:string}) => r.uid)).size : 0
+            const count = Math.max(0, totalNodes - 1)
+            dependenciesCount.value = count
+            return {
+                ...(!onlyCount ? {data: transformResponse(data, options.subtype)} : {}),
+                count,
             }
-
-            const creationPanels = localStorage.getItem(`el-fl-creation-${creationId.value}`) ?? YAML_UTILS.stringify([]);
-            localStorage.setItem(`el-fl-${flow.value!.namespace}-${flow.value!.id}`, creationPanels);
-
-            flow.value = response.data;
-
-            // clean-up
-            localStorage.removeItem(`el-fl-creation-${creationId.value}`);
-            creationId.value = undefined;
-
-            return response.data;
         })
     }
 
     function loadDependencies(options: { namespace: string, id: string, subtype: "FLOW" | "EXECUTION" }, onlyCount = false) {
-        return axios.get(`${apiUrl()}/flows/${options.namespace}/${options.id}/dependencies?expandAll=${onlyCount ? false : true}`).then(response => {
-            return {
-                ...(!onlyCount ? {data: transformResponse(response.data, options.subtype)} : {}),
-                count: response.data.nodes ? new Set(response.data.nodes.map((r:{uid:string}) => r.uid)).size : 0
-            };
-        })
+        if (!onlyCount) {
+            return requestDependencies(options, onlyCount)
+        }
+
+        const key = `${options.namespace}/${options.id}`
+        const inFlight = inFlightDependencyCounts.get(key)
+        if (inFlight) {
+            return inFlight
+        }
+
+        const request = requestDependencies(options, onlyCount)
+        inFlightDependencyCounts.set(key, request)
+        // Both handlers, so this derived promise never becomes an unhandled rejection.
+        const settle = () => {
+            if (inFlightDependencyCounts.get(key) === request) {
+                inFlightDependencyCounts.delete(key)
+            }
+        }
+        request.then(settle, settle)
+
+        return request
     }
 
 function deleteFlowAndDependencies() {
-    const metadata = flowYamlMetadata.value;
+    const metadataForDelete = flowYamlMetadata.value
 
-    return axios
-        .get(
-            `${apiUrl()}/flows/${metadata.namespace}/${metadata.id}/dependencies`,
-            {params: {destinationOnly: true}}
-        )
-        .then((response) => {
-            let warning = "";
-            if (response.data && response.data.nodes) {
-                const deps = response.data.nodes
+    return FlowsAPI.flowDependencies({namespace: metadataForDelete.namespace ?? "", id: metadataForDelete.id ?? "", destinationOnly: true})
+        .then((data) => {
+            let warning = ""
+            if (data && data.nodes) {
+                const deps = data.nodes
                     .filter(
-                        (n: any) =>
+                        (n) =>
                             !(
-                                n.namespace === metadata.namespace &&
-                                n.id === metadata.id
-                            )
+                                n.namespace === metadataForDelete.namespace &&
+                                n.id === metadataForDelete.id
+                            ),
                     )
                     .map(
-                        (n: any) =>
+                        (n) =>
                             "<li>" +
                             n.namespace +
                             ".<code>" +
                             n.id +
-                            "</code></li>"
+                            "</code></li>",
                     )
-                    .join("\n");
+                    .join("\n")
 
                 if (deps.length) {
                     warning =
-                        "<div class=\"el-alert el-alert--warning is-light mt-3\" role=\"alert\">\n" +
-                        "<div class=\"el-alert__content\">\n" +
-                        "<p class=\"el-alert__description\">\n" +
+                        "<div style=\"margin-top: var(--ks-spacing-3); padding: var(--ks-spacing-2) var(--ks-spacing-4); border-radius: var(--ks-radius-base); background: var(--ks-bg-warning); border: 1px solid var(--ks-border-warning); color: var(--ks-text-warning);\" role=\"alert\">\n" +
+                        "<p style=\"margin: 0;\">\n" +
                         t("dependencies delete flow") +
                         "<ul>\n" +
                         deps +
                         "</ul>\n" +
                         "</p>\n" +
-                        "</div>\n" +
-                        "</div>";
+                        "</div>"
                 }
             }
-            return t("delete confirm", {name: metadata.id}) + warning;
+            return t("delete confirm", {name: metadataForDelete.id}) + warning
         })
         .then((message) => {
             return new Promise((resolve, reject) => {
                 toast.confirm(message, () => {
-                    return deleteFlow({namespace: metadata.namespace, id: metadata.id}).then(resolve).catch(reject);
-                }, "warning");
-            });
+                    return deleteFlow({namespace: metadataForDelete.namespace ?? "", id: metadataForDelete.id ?? ""}).then(resolve).catch(reject)
+                }, "warning")
+            })
         })
         .catch(error => {
-            return Promise.reject(error);
-        });
+            return Promise.reject(error)
+        })
 }
 
     function deleteFlow(options: { namespace: string, id: string }) {
-        return axios.delete(`${apiUrl()}/flows/${options.namespace}/${options.id}`).then(() => {
-            flow.value = undefined;
+        return FlowsAPI.deleteFlow(options).then(() => {
+            flow.value = undefined
         })
     }
 
-    function loadGraph(options: { flow: Flow, params?: any }) {
-        const flowVar = options.flow;
-        const params = options.params ? options.params : {};
-        if (flowVar.revision) {
-            params["revision"] = flowVar.revision;
-        }
-        return axios.get(`${apiUrl()}/flows/${flowVar.namespace}/${flowVar.id}/graph`, {params}).then(response => {
-            invalidGraph.value = false;
-            flowGraph.value = response.data;
-            return response.data;
+    function loadGraph(options: { flow: Flow, params?: { subflows?: string[] } }): Promise<FlowGraph | undefined> {
+        const flowVar = options.flow
+        return FlowsAPI.generateFlowGraph({
+            namespace: flowVar.namespace,
+            id: flowVar.id,
+            revision: flowVar.revision,
+            subflows: options.params?.subflows,
+        }).then(data => {
+            invalidGraph.value = false
+            flowGraph.value = data as unknown as FlowGraph
+            return flowGraph.value
         }).catch(() => {
-            invalidGraph.value = true;
-        });
+            invalidGraph.value = true
+            return undefined
+        })
     }
-    function loadGraphFromSource(options: { flow: string, config?: any }) {
-        const config = options.config ? {...options.config, ...textYamlHeader} : textYamlHeader;
-        const flowParsed = YAML_UTILS.parse(options.flow);
+    function loadGraphFromSource(options: { flow: string, config?: GraphSubflows }) {
+        const subflows: string[] | undefined = options.config?.params?.subflows
+            ? String(options.config.params.subflows).split(",").filter(Boolean)
+            : undefined
+        const flowParsed = YAML_UTILS.parse<ParsedFlow>(options.flow)
         let flowSource = options.flow
-        if (!flowParsed.id || !flowParsed.namespace) {
+        if (!flowParsed?.id || !flowParsed.namespace) {
             flowSource = YAML_UTILS.updateMetadata(flowSource, {id: "default", namespace: "default"})
         }
-        return axios.post(`${apiUrl()}/flows/graph`, flowSource, {...config, withCredentials: true})
-            .then(response => {
-                flowGraph.value = response.data
+        return FlowsAPI.generateFlowGraphFromSource(
+            {subflows, body: flowSource},
+            {showMessageOnError: false} as Parameters<typeof FlowsAPI.generateFlowGraphFromSource>[1],
+        )
+            .then(data => {
+                invalidGraph.value = false
+                flowGraph.value = data as unknown as FlowGraph
 
-                const flowVar = YAML_UTILS.parse(options.flow);
-                flowVar.id = flow.value?.id ?? flowVar.id;
-                flowVar.namespace = flow.value?.namespace ?? flowVar.namespace;
-                flowVar.source = options.flow;
-                // prevent losing revision when loading graph from source
-                flowVar.revision = flow.value?.revision;
-                flow.value = flowVar;
-
-                return response;
-            }).catch(error => {
-                if (error.response?.status === 422 && (!config?.params?.subflows || config?.params?.subflows?.length === 0)) {
-                    return Promise.resolve(error.response);
+                const flowVar = YAML_UTILS.parse<Flow>(options.flow)
+                if (flowVar) {
+                    flowVar.id = flow.value?.id ?? flowVar.id
+                    flowVar.namespace = flow.value?.namespace ?? flowVar.namespace
+                    flowVar.source = options.flow
+                    flowVar.revision = flow.value?.revision
+                    flowVar.draft = flow.value?.draft
+                    flow.value = flowVar
                 }
 
-                if ([404, 422].includes(error.response?.status) && config?.params?.subflows?.length > 0) {
+                return data
+            }).catch(error => {
+                if (error.status === 422 && (!subflows || subflows.length === 0)) {
+                    // flowGraph is deliberately left on the last good layout rather than cleared,
+                    // so invalidGraph is what tells the canvas it is showing stale nodes.
+                    invalidGraph.value = true
+                    return Promise.resolve(error.response)
+                }
+
+                if ([404, 422].includes(error.status) && subflows && subflows.length > 0) {
                     coreStore.message = {
                         title: "Couldn't expand subflow",
-                        message: error.response.data.message,
-                        variant: "error"
-                    };
+                        content: asProblem(error)?.detail,
+                        variant: "error",
+                    }
                 }
 
-                return Promise.reject(error);
+                return Promise.reject(error)
             })
     }
 
-    function getGraphFromSourceResponse(options: { flow: string, config?: any }) {
-        const config = options.config ? {...options.config, ...textYamlHeader} : textYamlHeader;
-        const flowParsed = YAML_UTILS.parse(options.flow);
+    function getGraphFromSourceResponse(options: { flow: string, config?: GraphSubflows }) {
+        const subflows: string[] | undefined = options.config?.params?.subflows
+            ? String(options.config.params.subflows).split(",").filter(Boolean)
+            : undefined
+        const flowParsed = YAML_UTILS.parse<ParsedFlow>(options.flow)
         let flowSource = options.flow
-        if (!flowParsed.id || !flowParsed.namespace) {
+        if (!flowParsed?.id || !flowParsed.namespace) {
             flowSource = YAML_UTILS.updateMetadata(flowSource, {id: "default", namespace: "default"})
         }
-        return axios.post(`${apiUrl()}/flows/graph`, flowSource, {...config})
-            .then(response => response.data)
+        return FlowsAPI.generateFlowGraphFromSource({subflows, body: flowSource})
     }
 
-    function loadRevisions(options: { namespace: string, id: string, store?: boolean, allowDeleted?: boolean }) {
-        return axios.get(`${apiUrl()}/flows/${options.namespace}/${options.id}/revisions`).then(response => {
+    function loadRevisions(options: { namespace: string, id: string, store?: boolean, allowDeleted?: boolean }): Promise<FlowRevision[]> {
+        return FlowsAPI.listFlowRevisions({namespace: options.namespace, id: options.id}).then(data => {
+            const flowRevisions = data as FlowRevision[]
             if (options.store !== false) {
-                revisions.value = response.data
+                revisions.value = flowRevisions
             }
-            return response.data;
+            revisionsCount.value = Array.isArray(data) ? data.length : 0
+            return flowRevisions
         })
     }
 
-    function exportFlowByIds(options: { ids: string[] }) {
-        return axios.post(`${apiUrl()}/flows/export/by-ids`, options.ids, {responseType: "blob"})
-            .then(response => {
-                const blob = new Blob([response.data], {type: "application/octet-stream"});
-                const url = window.URL.createObjectURL(blob)
-                Utils.downloadUrl(url, "flows.zip");
-            });
+    function loadFlowStats(options: { namespace: string, id: string }) {
+        return Promise.allSettled([
+            loadRevisions({namespace: options.namespace, id: options.id, store: false}),
+            loadDependencies({namespace: options.namespace, id: options.id, subtype: "FLOW"}, true),
+        ])
     }
 
-    function exportFlowByQuery(options: { namespace: string, id: string }) {
-        return axios.get(`${apiUrl()}/flows/export/by-query`, {params: options, headers: {"Accept": "application/octet-stream"}})
-            .then(response => {
-                Utils.downloadUrl(response.request.responseURL, "flows.zip");
-            });
+    function clearFlowStats() {
+        revisionsCount.value = undefined
+        dependenciesCount.value = undefined
     }
 
-    async function exportFlowAsCSV(params: any) {
-        const response = await axios.get(
-            `${apiUrl()}/flows/export/by-query/csv`,
-            {params, responseType: "blob"}
-        );
-        const url = window.URL.createObjectURL(new Blob([response.data]));
-        const link = document.createElement("a");
-        link.href = url;
-        link.setAttribute("download", "flows.csv");
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        window.URL.revokeObjectURL(url);
-    }
-
-    function importFlows(options: { file: FormData,  failOnError: boolean }) {
-         const {file, failOnError} = options;
-        return axios.post(`${apiUrl()}/flows/import`, file, {
-            headers: {"Content-Type": "multipart/form-data"},
-            params: {failOnError}
-        }).then(response => {
-            return response;
-        });
-    }
-    function disableFlowByIds(options: { ids: {id: string, namespace: string}[] }) {
-        return axios.post(`${apiUrl()}/flows/disable/by-ids`, options.ids)
-    }
-    function disableFlowByQuery(options: { namespace: string, id: string }) {
-        return axios.post(`${apiUrl()}/flows/disable/by-query`, options, {params: options})
-    }
-    function enableFlowByIds(options: { ids: {id: string, namespace: string}[] }) {
-        return axios.post(`${apiUrl()}/flows/enable/by-ids`, options.ids)
-    }
-    function enableFlowByQuery(options: { namespace: string, id: string }) {
-        return axios.post(`${apiUrl()}/flows/enable/by-query`, options, {params: options})
-    }
-
-    function deleteFlowByIds(options: { ids: {id: string, namespace: string}[] }) {
-        return axios.delete(`${apiUrl()}/flows/delete/by-ids`, {data: options.ids})
-    }
-
-    function deleteFlowByQuery(options: { namespace: string, id: string }) {
-        return axios.delete(`${apiUrl()}/flows/delete/by-query`, {params: options})
-    }
+    let latestValidation = 0
 
     function validateFlow(options: { flow: string }) {
-        const flowValidationIssues: FlowValidations = {};
+        const validation = ++latestValidation
+        let creationDenied: string | undefined
         if(isCreating.value) {
-            const {namespace} = YAML_UTILS.getMetadata(options.flow);
+            const {namespace} = YAML_UTILS.getMetadata<ParsedFlow>(options.flow)
             if(authStore.user && !authStore.user?.isAllowed(
-                permission.FLOW,
+                resource.FLOW,
                 action.CREATE,
                 namespace,
             )) {
-                flowValidationIssues.constraints = t("flow creation denied in namespace", {namespace});
+                creationDenied = t("flow creation denied in namespace", {namespace})
             }
         }
-        
-        return axios.post(`${apiUrl()}/flows/validate`, options.flow, {...textYamlHeader, withCredentials: true})
-            .then(response => {
-                const validResults = response.data[0] ?? {};
 
-                const constraintsArray = [validResults.constraints, flowValidationIssues.constraints].filter(Boolean)
-
-                if (constraintsArray.length) {
-                    validResults.constraints = constraintsArray.join(", ");
-                } else {
-                    delete validResults.constraints;
+        return FlowsAPI.validateFlows({body: options.flow}, {withCredentials: true})
+            .then(results => {
+                const validResults: FlowValidations = results[0] ?? {}
+                if (creationDenied) {
+                    validResults.errors = [...(validResults.errors ?? []), {detail: creationDenied}]
                 }
 
-                flowValidation.value = validResults;
-                
+                // A response overtaken by a newer validation describes a source the editor no longer holds.
+                if (validation === latestValidation) {
+                    flowValidation.value = validResults
+                }
                 return validResults
             })
     }
 
     function validateTask(options: { task: string, section: string }) {
-        return axios.post(`${apiUrl()}/flows/validate/task`, options.task, {...textYamlHeader, withCredentials: true, params: {section: options.section}})
-            .then(response => {
-                taskError.value = response.data.constraints;
-                return response.data
-            })
+        return FlowsAPI.validateTask(
+            {
+                section: options.section as Parameters<typeof FlowsAPI.validateTask>[0]["section"],
+                // The endpoint takes the task as YAML (see the header below), which the generated
+                // body type - an object schema - cannot express.
+                body: options.task as unknown as Parameters<typeof FlowsAPI.validateTask>[0]["body"],
+            },
+            {withCredentials: true, headers: textYamlHeader.headers},
+        ).then(result => {
+            taskErrors.value = result.errors
+            return result
+        })
     }
     function loadFlowMetrics(options: { namespace: string, id: string }) {
-        return axios.get(`${apiUrl()}/metrics/names/${options.namespace}/${options.id}`)
-            .then(response => {
-                metrics.value = response.data
-                return response.data
+        return MetricsAPI.listFlowMetrics({namespace: options.namespace, flowId: options.id})
+            .then(data => {
+                metrics.value = data
+                return data
             })
     }
     function loadTaskMetrics(options: { namespace: string, id: string, taskId: string }) {
-        return axios.get(`${apiUrl()}/metrics/names/${options.namespace}/${options.id}/${options.taskId}`)
-            .then(response => {
-                metrics.value = response.data
-                return response.data
+        return MetricsAPI.listTaskMetrics({namespace: options.namespace, flowId: options.id, taskId: options.taskId})
+            .then(data => {
+                metrics.value = data
+                return data
             })
     }
     function loadTasksWithMetrics(options: { namespace: string, id: string }) {
-        return axios.get(`${apiUrl()}/metrics/tasks/${options.namespace}/${options.id}`)
-            .then(response => {
-                tasksWithMetrics.value = response.data
-                return response.data
+        return MetricsAPI.listTasksWithMetrics({namespace: options.namespace, flowId: options.id})
+            .then(data => {
+                tasksWithMetrics.value = data
+                return data
             })
     }
-    function loadFlowAggregatedMetrics(options: { namespace: string, id: string, metric: string }) {
-        return axios.get(`${apiUrl()}/metrics/aggregates/${options.namespace}/${options.id}/${options.metric}`, {params: options})
-            .then(response => {
-                aggregatedMetrics.value = response.data
-                return response.data
+    function loadFlowAggregatedMetrics(options: { namespace: string, id: string, metric: string, aggregation?: string, startDate?: string, endDate?: string }) {
+        return MetricsAPI.aggregateMetricsFromFlow({namespace: options.namespace, flowId: options.id, metric: options.metric, aggregation: options.aggregation, startDate: options.startDate, endDate: options.endDate})
+            .then(data => {
+                return data
             })
     }
-    function loadTaskAggregatedMetrics(options: { namespace: string, id: string, taskId: string, metric: string }) {
-        return axios.get(`${apiUrl()}/metrics/aggregates/${options.namespace}/${options.id}/${options.taskId}/${options.metric}`, {params: options})
-            .then(response => {
-                aggregatedMetrics.value = response.data
-                return response.data
+    function loadTaskAggregatedMetrics(options: { namespace: string, id: string, taskId: string, metric: string, aggregation?: string, startDate?: string, endDate?: string }) {
+        return MetricsAPI.aggregateMetricsFromTask({namespace: options.namespace, flowId: options.id, taskId: options.taskId, metric: options.metric, aggregation: options.aggregation, startDate: options.startDate, endDate: options.endDate})
+            .then(data => {
+                return data
             })
     }
 
     function setTrigger({index, trigger}: { index: number, trigger: Trigger }) {
-        const flowVar = flow.value ?? {} as Flow;
+        const flowVar = flow.value ?? {} as Flow
 
         if (flowVar.triggers === undefined) {
             flowVar.triggers = []
         }
 
-        flowVar.triggers[index] = trigger;
+        flowVar.triggers[index] = trigger
 
         flow.value = {...flowVar}
     }
 
     function removeTrigger(index: number) {
-        const flowVar = flow.value ?? {} as Flow;
-        flowVar.triggers?.splice(index, 1);
+        const flowVar = flow.value ?? {} as Flow
+        flowVar.triggers?.splice(index, 1)
 
         flow.value = {...flowVar}
     }
 
     function setExecuteFlow(value: boolean) {
-        executeFlow.value = value;
-    }
-
-    function setOpenAiCopilot(value: boolean) {
-        openAiCopilot.value = value;
+        executeFlow.value = value
     }
 
     function addTrigger(trigger: Trigger) {
-        const flowVar = flow.value ?? {} as Flow;
+        const flowVar = flow.value ?? {} as Flow
 
         if (trigger.backfill === undefined) {
             trigger.backfill = {
-                start: undefined
+                start: undefined,
             }
         }
 
@@ -834,85 +956,86 @@ function deleteFlowAndDependencies() {
     }
 
     function deleteRevision(options: { namespace: string, id: string, revision: string }) {
-        return axios.delete(`${apiUrl()}/flows/${options.namespace}/${options.id}/revisions?revisions=${options.revision}`);
+        return FlowsAPI.deleteRevisions({namespace: options.namespace, id: options.id, revisions: [Number(options.revision)]})
     }
 
     const authStore = useAuthStore()
 
     const isAllowedEdit = computed((): boolean => {
         if (!flow.value || !authStore.user) {
-            return false;
+            return false
         }
 
-        return (isCreating.value && authStore.user?.hasAnyAction(permission.FLOW, action.UPDATE))
+        return (isCreating.value && authStore.user?.hasAnyAction(resource.FLOW, action.UPDATE))
          || authStore.user?.isAllowed(
-            permission.FLOW,
+            resource.FLOW,
             action.UPDATE,
             flow.value?.namespace,
-        );
+        )
     })
 
     const readOnlySystemLabel = computed(() => {
-        if (!flow.value || !flow.value.labels) {
-            return false;
+        if (!flow.value?.labels) {
+            return false
         }
 
-        return (flow.value.labels?.["system.readOnly"] === "true") || (flow.value.labels?.["system.readOnly"] === true);
+        const labelsArray = Array.isArray(flow.value.labels) ? flow.value.labels : Object.entries(flow.value.labels).map(([key, value]) => ({key, value}))
+
+        return labelsArray.some(label => label.key === "system.readOnly" && label.value === "true")
     })
 
     const isReadOnly = computed(() => {
-        return flow.value?.deleted || !isAllowedEdit.value || readOnlySystemLabel.value;
+        return flow.value?.deleted || !isAllowedEdit.value || readOnlySystemLabel.value
     })
 
     const baseOutdatedTranslationKey = computed(() => {
-        const createOrUpdateKey = isCreating.value ? "create" : "update";
-        return "outdated revision save confirmation." + createOrUpdateKey;
+        const createOrUpdateKey = isCreating.value ? "create" : "update"
+        return "outdated revision save confirmation." + createOrUpdateKey
     })
 
     const flowErrors = computed((): string[] | undefined => {
-        const key = baseOutdatedTranslationKey.value;
+        const key = baseOutdatedTranslationKey.value
         const flowExistsError =
             flowValidation.value?.outdated && isCreating.value
                 ? [`${t(key + ".description")} ${t(key + ".details")}`]
-                : [];
+                : []
 
-        const constraintsError =
-            flowValidation.value?.constraints?.split(/, ?/) ?? [];
+        const constraintsError = validationErrorLines(flowValidation.value?.errors)
 
-        const errors = [...flowExistsError, ...constraintsError];
+        const errors = [...flowExistsError, ...constraintsError]
 
-        return errors.length === 0 ? undefined : errors;
+        return errors.length === 0 ? undefined : errors
     })
 
     const flowInfos = computed(() => {
-        const infos = flowValidation.value?.infos ?? [];
+        const infos = flowValidation.value?.infos ?? []
 
-        return infos.length === 0 ? undefined : infos;
+        return infos.length === 0 ? undefined : infos
     })
 
     const flowHaveTasks = computed((): boolean => {
-        const flowVar = isCreating.value ? flow.value?.source : flowYaml.value;
-        return flowVar ? YAML_UTILS.flowHaveTasks(flowVar) : false;
+        const flowVar = isCreating.value ? flow.value?.source : flowYaml.value
+        return flowVar ? YAML_UTILS.flowHaveTasks(flowVar) : false
     })
 
     const nextRevision = computed((): number => {
-        return (flow.value?.revision ?? 0) + 1;
+        return (flow.value?.revision ?? 0) + 1
     })
 
     const yamlWithNextRevision = computed((): string => {
-        if (!flowYaml.value) return "";
-        return `revision: ${nextRevision.value}\n${flowYaml.value}`;
+        if (!flowYaml.value) return ""
+        return `revision: ${nextRevision.value}\n${flowYaml.value}`
     })
 
     const flowParsed = computed(() => {
         try {
-            return YAML_UTILS.parse(flowYaml.value)
+            return YAML_UTILS.parse<ParsedFlow>(flowYaml.value)
         } catch {
             return undefined
         }
     })
     const flowYamlMetadata = computed(() => {
-        return YAML_UTILS.getMetadata(flowYaml.value ?? "");
+        return YAML_UTILS.getMetadata<ParsedFlow>(flowYaml.value ?? "")
     })
 
     return {
@@ -930,36 +1053,35 @@ function deleteFlowAndDependencies() {
         flowYamlMetadata,
         flows,
         flow,
-        task,
         search,
         total,
-        overallTotal,
         flowGraph,
         invalidGraph,
         revisions,
+        revisionsCount,
+        dependenciesCount,
+        filesSaveAll,
+        hasDirtyEditorFiles,
         flowValidation,
-        taskError,
+        taskErrors,
         metrics,
-        aggregatedMetrics,
         tasksWithMetrics,
         executeFlow,
-        openAiCopilot,
-        lastSaveFlow,
         isCreating,
         flowYaml,
         flowYamlOrigin,
-        confirmOutdatedSaveDialog,
+        previewSource,
+        declinePreview,
         haveChange,
         expandedSubflows,
-        metadata,
         addTrigger,
         setTrigger,
         removeTrigger,
         setExecuteFlow,
-        setOpenAiCopilot,
-        onSaveMetadata,
         saveAll,
+        saveAsDraft,
         save,
+        publishDraft,
         onEdit,
         initYamlSource,
         findFlows,
@@ -968,25 +1090,17 @@ function deleteFlowAndDependencies() {
         loadFlow,
         loadTask,
         saveFlow,
-        updateFlowTask,
         createFlow,
         loadDependencies,
         deleteFlowAndDependencies,
         deleteFlow,
         loadGraph,
         loadGraphFromSource,
+        fetchGraph,
         getGraphFromSourceResponse,
         loadRevisions,
-        exportFlowByIds,
-        exportFlowByQuery,
-        exportFlowAsCSV,
-        importFlows,
-        disableFlowByIds,
-        disableFlowByQuery,
-        enableFlowByIds,
-        enableFlowByQuery,
-        deleteFlowByIds,
-        deleteFlowByQuery,
+        loadFlowStats,
+        clearFlowStats,
         validateFlow,
         validateTask,
         loadFlowMetrics,
@@ -995,6 +1109,6 @@ function deleteFlowAndDependencies() {
         loadTaskAggregatedMetrics,
         loadTasksWithMetrics,
         getNamespace,
-        deleteRevision
+        deleteRevision,
     }
 })

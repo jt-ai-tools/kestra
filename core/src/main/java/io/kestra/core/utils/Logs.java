@@ -1,13 +1,19 @@
 package io.kestra.core.utils;
 
-import io.kestra.core.models.executions.Execution;
-import io.kestra.core.models.executions.TaskRun;
-import io.kestra.core.models.flows.FlowId;
-import io.kestra.core.models.triggers.TriggerContext;
+import java.util.ArrayList;
+import java.util.List;
+
 import org.apache.commons.lang3.ArrayUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.slf4j.event.Level;
+
+import io.kestra.core.models.executions.Execution;
+import io.kestra.core.models.executions.ExecutionId;
+import io.kestra.core.models.executions.TaskRun;
+import io.kestra.core.models.flows.FlowId;
+import io.kestra.core.models.triggers.TriggerId;
 
 /**
  * Utility class for server logging
@@ -19,13 +25,22 @@ public final class Logs {
     private static final String TRIGGER_PREFIX_WITH_TENANT = FLOW_PREFIX_WITH_TENANT + "[trigger: {}] ";
     private static final String TASKRUN_PREFIX_WITH_TENANT = FLOW_PREFIX_WITH_TENANT + "[task: {}] [execution: {}] [taskrun: {}] ";
 
-    private Logs() {}
+    private Logs() {
+    }
 
     public static void logExecution(FlowId flow, Logger logger, Level level, String message, Object... args) {
         String finalMsg = FLOW_PREFIX_WITH_TENANT + message;
         Object[] executionArgs = new Object[] { flow.getTenantId(), flow.getNamespace(), flow.getId() };
         Object[] finalArgs = ArrayUtils.addAll(executionArgs, args);
-        logger.atLevel(level).log(finalMsg, finalArgs);
+        try (
+            var _ = mdcScope(
+                "tenantId", flow.getTenantId(),
+                "namespace", flow.getNamespace(),
+                "flowId", flow.getId()
+            )
+        ) {
+            logger.atLevel(level).log(finalMsg, finalArgs);
+        }
     }
 
     /**
@@ -39,21 +54,45 @@ public final class Logs {
     public static void logExecution(Execution execution, Logger logger, Level level, String message, Object... args) {
         Object[] executionArgs = new Object[] { execution.getTenantId(), execution.getNamespace(), execution.getFlowId(), execution.getId() };
         Object[] finalArgs = ArrayUtils.addAll(executionArgs, args);
+        try (
+            var _ = mdcScope(
+                "tenantId", execution.getTenantId(),
+                "namespace", execution.getNamespace(),
+                "flowId", execution.getFlowId(),
+                "executionId", execution.getId()
+            )
+        ) {
+            logger.atLevel(level).log(EXECUTION_PREFIX_WITH_TENANT + message, finalArgs);
+        }
+    }
+
+    public static void logExecutionId(ExecutionId executionId, Logger logger, Level level, String message, Object... args) {
+        Object[] executionArgs = new Object[] { executionId.tenantId(), executionId.namespace(), executionId.flowId(), executionId.executionId() };
+        Object[] finalArgs = ArrayUtils.addAll(executionArgs, args);
         logger.atLevel(level).log(EXECUTION_PREFIX_WITH_TENANT + message, finalArgs);
     }
 
     /**
-     * Log a {@link TriggerContext} via the scheduler logger named: 'trigger.{tenantId}.{namespace}.{flowId}.{triggerId}'.
+     * Log a {@link TriggerId} via the scheduler logger named: 'trigger.{tenantId}.{namespace}.{flowId}.{triggerId}'.
      */
-    public static void logTrigger(TriggerContext triggerContext, Level level, String message, Object... args) {
-        Logger logger = logger(triggerContext);
-        logTrigger(triggerContext, logger, level, message, args);
+    public static void logTrigger(TriggerId trigger, Level level, String message, Object... args) {
+        Logger logger = logger(trigger);
+        logTrigger(trigger, logger, level, message, args);
     }
 
-    public static void logTrigger(TriggerContext triggerContext, Logger logger, Level level, String message, Object... args) {
-        Object[] executionArgs = new Object[] { triggerContext.getTenantId(), triggerContext.getNamespace(), triggerContext.getFlowId(), triggerContext.getTriggerId() };
+    public static void logTrigger(TriggerId trigger, Logger logger, Level level, String message, Object... args) {
+        Object[] executionArgs = new Object[] { trigger.getTenantId(), trigger.getNamespace(), trigger.getFlowId(), trigger.getTriggerId() };
         Object[] finalArgs = ArrayUtils.addAll(executionArgs, args);
-        logger.atLevel(level).log(TRIGGER_PREFIX_WITH_TENANT + message, finalArgs);
+        try (
+            var _ = mdcScope(
+                "tenantId", trigger.getTenantId(),
+                "namespace", trigger.getNamespace(),
+                "flowId", trigger.getFlowId(),
+                "triggerId", trigger.getTriggerId()
+            )
+        ) {
+            logger.atLevel(level).log(TRIGGER_PREFIX_WITH_TENANT + message, finalArgs);
+        }
     }
 
     /**
@@ -68,7 +107,18 @@ public final class Logs {
         }
         Object[] finalArgs = ArrayUtils.addAll(executionArgs, args);
         Logger logger = logger(taskRun);
-        logger.atLevel(level).log(finalMsg, finalArgs);
+        try (
+            var _ = mdcScope(
+                "tenantId", taskRun.getTenantId(),
+                "namespace", taskRun.getNamespace(),
+                "flowId", taskRun.getFlowId(),
+                "taskId", taskRun.getTaskId(),
+                "executionId", taskRun.getExecutionId(),
+                "taskRunId", taskRun.getId()
+            )
+        ) {
+            logger.atLevel(level).log(finalMsg, finalArgs);
+        }
     }
 
     private static Logger logger(TaskRun taskRun) {
@@ -77,9 +127,9 @@ public final class Logs {
         );
     }
 
-    private static Logger logger(TriggerContext triggerContext) {
+    private static Logger logger(TriggerId trigger) {
         return LoggerFactory.getLogger(
-            "scheduler." + triggerContext.getTenantId() + "." + triggerContext.getNamespace() + "." + triggerContext.getFlowId() + "." + triggerContext.getTriggerId()
+            "scheduler." + trigger.getTenantId() + "." + trigger.getNamespace() + "." + trigger.getFlowId() + "." + trigger.getTriggerId()
         );
     }
 
@@ -87,5 +137,29 @@ public final class Logs {
         return LoggerFactory.getLogger(
             "executor." + execution.getTenantId() + "." + execution.getNamespace() + "." + execution.getFlowId()
         );
+    }
+
+    /**
+     * Populates SLF4J MDC for the duration of a try-with-resources block, then removes
+     * only the keys it set. Skips null values.
+     */
+    private static MDCScope mdcScope(String... kvPairs) {
+        List<String> putKeys = new ArrayList<>(kvPairs.length / 2);
+        for (int i = 0; i + 1 < kvPairs.length; i += 2) {
+            if (kvPairs[i + 1] != null) {
+                MDC.put(kvPairs[i], kvPairs[i + 1]);
+                putKeys.add(kvPairs[i]);
+            }
+        }
+        return () -> putKeys.forEach(MDC::remove);
+    }
+
+    /**
+     * Narrows {@link AutoCloseable#close()} to remove the {@code throws Exception},
+     * so callers don't need a {@code try/catch} around a plain MDC cleanup.
+     */
+    private interface MDCScope extends AutoCloseable {
+        @Override
+        void close();
     }
 }

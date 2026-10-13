@@ -1,70 +1,114 @@
 package io.kestra.core.services;
 
-import io.kestra.core.repositories.KvMetadataRepositoryInterface;
-import io.kestra.core.storages.StorageInterface;
+import java.io.IOException;
+import java.util.Optional;
+
+import io.kestra.core.exceptions.ResourceAccessDeniedException;
+import io.kestra.core.exceptions.ResourceExpiredException;
+import io.kestra.core.models.namespaces.NamespaceInterface;
+import io.kestra.core.runners.KVMetadataStateStore;
 import io.kestra.core.storages.kv.InternalKVStore;
+import io.kestra.core.storages.kv.KVBackend;
 import io.kestra.core.storages.kv.KVStore;
 import io.kestra.core.storages.kv.KVStoreException;
-import io.micronaut.data.model.Pageable;
+import io.kestra.core.storages.kv.KVValue;
+
 import jakarta.annotation.Nullable;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 
-import java.io.IOException;
-
+/**
+ * Gives access to the namespace Key-Value stores, from any server including a worker, once the access is allowed.
+ * For server-side administration (paginated listing, purging), see {@link KVService}.
+ */
 @Singleton
 public class KVStoreService {
-    @Inject
-    private KvMetadataRepositoryInterface kvMetadataRepository;
+    private final KVBackend backend;
+    private final NamespaceService namespaceService;
+    private final KVMetadataStateStore kvMetadataStateStore;
 
     @Inject
-    private StorageInterface storageInterface;
-
-    @Inject
-    private NamespaceService namespaceService;
+    public KVStoreService(KVBackend backend, NamespaceService namespaceService, KVMetadataStateStore kvMetadataStateStore) {
+        this.backend = backend;
+        this.namespaceService = namespaceService;
+        this.kvMetadataStateStore = kvMetadataStateStore;
+    }
 
     /**
      * Gets access to the Key-Value store for the given namespace.
      *
-     * @param tenant        The tenant ID.
-     * @param namespace     The namespace of the K/V store.
+     * @param tenant The tenant ID.
+     * @param namespace The namespace of the K/V store.
+     * @return The {@link KVStore}.
+     */
+    public KVStore get(String tenant, String namespace) {
+        return get(tenant, namespace, namespace);
+    }
+
+    /**
+     * Gets access to the Key-Value store for the given namespace.
+     *
+     * @param tenant The tenant ID.
+     * @param namespace The namespace of the K/V store.
      * @param fromNamespace The namespace from which the K/V store is accessed.
      * @return The {@link KVStore}.
      */
     public KVStore get(String tenant, String namespace, @Nullable String fromNamespace) {
-        boolean isNotSameNamespace = fromNamespace != null && !namespace.equals(fromNamespace);
-        if (isNotSameNamespace && isNotParentNamespace(namespace, fromNamespace)) {
+        checkAccessNamespaceIsAllowed(tenant, namespace, fromNamespace);
+        return new InternalKVStore(tenant, namespace, backend);
+    }
+
+    /**
+     * Finds the value of a key in the given namespace, then in each of its parent namespaces up to the root,
+     * and returns the first one found.
+     *
+     * @throws ResourceExpiredException if the closest entry found for the key expired.
+     */
+    public Optional<KVValue> findValueWithInheritance(String tenant, String namespace, String key) throws IOException, ResourceExpiredException {
+        String current = namespace;
+        while (true) {
+            Optional<KVValue> value = get(tenant, current, namespace).getValue(key);
+            if (value.isPresent() || !current.contains(".")) {
+                return value;
+            }
+            current = current.substring(0, current.lastIndexOf('.'));
+        }
+    }
+
+    /**
+     * Checks if access to the given namespace is allowed from the specified namespace and if the namespace exists.
+     *
+     * @param tenant The tenant ID.
+     * @param namespace The namespace of the K/V store.
+     * @param fromNamespace The namespace from which the K/V store is accessed.
+     */
+    public void checkAccessNamespaceIsAllowed(String tenant, String namespace, @Nullable String fromNamespace) {
+        // A namespace inherits the K/V store of its ancestors, so the allow-list only governs access to any other namespace.
+        boolean inheritsTargetNamespace = NamespaceInterface.isDescendantOrSelf(namespace, fromNamespace);
+
+        if (fromNamespace != null && !inheritsTargetNamespace) {
             try {
                 namespaceService.checkAllowedNamespace(tenant, namespace, tenant, fromNamespace);
-            } catch (IllegalArgumentException e) {
-                throw new KVStoreException(String.format(
-                    "Cannot access the KV store. Access to '%s' namespace is not allowed from '%s'.", namespace, fromNamespace)
+            } catch (ResourceAccessDeniedException e) {
+                throw new KVStoreException(
+                    String.format(
+                        "Cannot access the KV store. Access to '%s' namespace is not allowed from '%s'.", namespace, fromNamespace
+                    )
                 );
             }
         }
 
         // Only check namespace existence if not a descendant
-        boolean checkIfNamespaceExists = fromNamespace == null || isNotParentNamespace(namespace, fromNamespace);
-        if (checkIfNamespaceExists && !namespaceService.isNamespaceExists(tenant, namespace)) {
+        if (!inheritsTargetNamespace && !namespaceService.isNamespaceExists(tenant, namespace)) {
             // if it didn't exist, we still check if there are KV as you can add KV without creating a namespace in DB or having flows in it
-            KVStore kvStore = new InternalKVStore(tenant, namespace, storageInterface, kvMetadataRepository);
-            try {
-                if (kvStore.list(Pageable.from(1, 1)).isEmpty()) {
-                    throw new KVStoreException(String.format(
+            if (!kvMetadataStateStore.existsByNamespace(tenant, namespace)) {
+                throw new KVStoreException(
+                    String.format(
                         "Cannot access the KV store. The namespace '%s' does not exist.",
                         namespace
-                    ));
-                }
-            } catch (IOException e) {
-                throw new KVStoreException(e);
+                    )
+                );
             }
-            return kvStore;
         }
-
-        return new InternalKVStore(tenant, namespace, storageInterface, kvMetadataRepository);
-    }
-
-    private static boolean isNotParentNamespace(final String parentNamespace, final String childNamespace) {
-        return !childNamespace.startsWith(parentNamespace);
     }
 }

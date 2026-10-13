@@ -1,24 +1,28 @@
 package io.kestra.plugin.core.kv;
 
+import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
+
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.tasks.RunnableTask;
 import io.kestra.core.models.tasks.Task;
+import io.kestra.core.runners.DefaultRunContext;
 import io.kestra.core.runners.RunContext;
+import io.kestra.core.services.KVService;
+import io.kestra.core.services.KVStoreService;
 import io.kestra.core.storages.kv.KVEntry;
-import io.kestra.core.storages.kv.KVStore;
 import io.kestra.plugin.core.purge.PurgeTask;
+
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
 import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.experimental.SuperBuilder;
 import lombok.extern.slf4j.Slf4j;
-
-import java.util.List;
-import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
 @SuperBuilder(toBuilder = true)
@@ -27,9 +31,7 @@ import java.util.concurrent.atomic.AtomicLong;
 @Schema(
     title = "Purge keys from the KV store.",
     description = """
-        Deletes keys across Namespaces using a purge `behavior` (default: expired-only). Filter by explicit `namespaces` or `namespacePattern`, optional `keyPattern`, and include/exclude child namespaces.
-
-        Deprecated `expiredOnly` overrides `behavior` if set."""
+        Deletes keys across Namespaces using a purge `behavior` (default: expired-only). Filter by explicit `namespaces` or `namespacePattern`, optional `keyPattern`, and include/exclude child namespaces."""
 )
 @Plugin(
     examples = {
@@ -43,7 +45,9 @@ import java.util.concurrent.atomic.AtomicLong;
                 tasks:
                   - id: purge_kv
                     type: io.kestra.plugin.core.kv.PurgeKV
-                    expiredOnly: true
+                    behavior:
+                      type: key
+                      expiredOnly: true
                     namespaces:
                       - company
                     includeChildNamespaces: true
@@ -76,6 +80,7 @@ public class PurgeKV extends Task implements PurgeTask<KVEntry>, RunnableTask<Pu
     )
     @Builder.Default
     @Valid
+    @NotNull
     private Property<KvPurgeBehavior> behavior = Property.ofValue(Key.builder().expiredOnly(true).build());
 
     @Schema(
@@ -85,29 +90,21 @@ public class PurgeKV extends Task implements PurgeTask<KVEntry>, RunnableTask<Pu
     @Builder.Default
     private Property<Boolean> includeChildNamespaces = Property.ofValue(true);
 
-    /**
-     * @deprecated use behavior.type: key + behavior.expiredOnly instead. Setting this property will override the `behavior` property.
-     */
-    @Deprecated(since = "1.1.0", forRemoval = true)
-    private Property<Boolean> expiredOnly;
-
     @Override
     public Output run(RunContext runContext) throws Exception {
         List<String> kvNamespaces = findNamespaces(runContext);
         runContext.logger().info("purging {} namespaces: {}", kvNamespaces.size(), kvNamespaces);
         AtomicLong count = new AtomicLong();
-        KvPurgeBehavior renderedBehavior;
-        if (expiredOnly != null) {
-            renderedBehavior = Key.builder()
-                .expiredOnly(runContext.render(expiredOnly).as(Boolean.class).orElse(true))
-                .build();
-        } else {
-            renderedBehavior = runContext.render(behavior).as(KvPurgeBehavior.class).orElseThrow();
-        }
-        for (String ns : kvNamespaces) {
-            KVStore kvStore = runContext.namespaceKv(ns);
-            List<KVEntry> toPurge = filterItems(runContext, renderedBehavior.entriesToPurge(kvStore));
-            count.addAndGet(kvStore.purge(toPurge));
+        KvPurgeBehavior renderedBehavior = runContext.render(behavior).as(KvPurgeBehavior.class).orElseThrow();
+
+        String tenantId = runContext.flowInfo().tenantId();
+        String namespace = runContext.flowInfo().namespace();
+        for (String targetNamespace : kvNamespaces) {
+            KVStoreService kvStoreService = ((DefaultRunContext) runContext).services().additionalService(KVStoreService.class);
+            KVService kvService = ((DefaultRunContext) runContext).services().additionalService(KVService.class);
+            kvStoreService.checkAccessNamespaceIsAllowed(tenantId, targetNamespace, namespace);
+            List<KVEntry> toPurge = filterItems(runContext, renderedBehavior.entriesToPurge(tenantId, targetNamespace, kvService));
+            count.addAndGet(kvService.purge(tenantId, targetNamespace, toPurge));
         }
         runContext.logger().info("purged {} keys", count.get());
 

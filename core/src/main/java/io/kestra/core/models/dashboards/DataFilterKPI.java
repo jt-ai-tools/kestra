@@ -1,10 +1,20 @@
 package io.kestra.core.models.dashboards;
 
+import java.time.Duration;
+import java.time.ZonedDateTime;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+
 import io.kestra.core.models.QueryFilter;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.dashboards.filters.AbstractFilter;
 import io.kestra.core.repositories.QueryBuilderInterface;
 import io.kestra.plugin.core.dashboard.data.IData;
+
+import jakarta.annotation.Nullable;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
@@ -13,11 +23,6 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 import lombok.experimental.SuperBuilder;
-
-import java.time.ZonedDateTime;
-import java.util.Collections;
-import java.util.List;
-import java.util.Set;
 
 import static io.kestra.core.utils.RegexPatterns.JAVA_IDENTIFIER_REGEX;
 
@@ -38,6 +43,13 @@ public abstract class DataFilterKPI<F extends Enum<F>, C extends ColumnDescripto
     private List<AbstractFilter<F>> numerator;
 
     private List<AbstractFilter<F>> where;
+
+    /** Set per request from the dashboard's own limit or the instance default; not part of the chart definition. */
+    @JsonIgnore
+    @Setter
+    @Nullable
+    @EqualsAndHashCode.Exclude
+    private Duration queryTimeout;
 
     public Set<F> aggregationForbiddenFields() {
         return Collections.emptySet();

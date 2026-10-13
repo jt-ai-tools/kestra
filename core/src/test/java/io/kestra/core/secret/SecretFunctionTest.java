@@ -1,25 +1,7 @@
 package io.kestra.core.secret;
 
-import static io.kestra.core.tenant.TenantService.MAIN_TENANT;
-import static org.assertj.core.api.Assertions.assertThat;
-
-import io.kestra.core.exceptions.IllegalVariableEvaluationException;
-import io.kestra.core.junit.annotations.KestraTest;
-import io.kestra.core.junit.annotations.LoadFlows;
-import io.kestra.core.models.executions.Execution;
-import io.kestra.core.models.executions.LogEntry;
-import io.kestra.core.models.flows.State;
-import io.kestra.core.queues.QueueException;
-import io.kestra.core.queues.QueueFactoryInterface;
-import io.kestra.core.queues.QueueInterface;
-import io.kestra.core.runners.TestRunnerUtils;
-import io.kestra.core.runners.VariableRenderer;
-import io.kestra.core.utils.TestsUtils;
-import io.micronaut.test.annotation.MockBean;
-import jakarta.inject.Inject;
-import jakarta.inject.Named;
-
 import java.io.IOException;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -29,16 +11,33 @@ import java.util.concurrent.TimeoutException;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
-import reactor.core.publisher.Flux;
 
+import io.kestra.core.exceptions.IllegalVariableEvaluationException;
+import io.kestra.core.exceptions.InternalException;
+import io.kestra.core.junit.annotations.KestraTest;
+import io.kestra.core.junit.annotations.LoadFlows;
+import io.kestra.core.models.executions.Execution;
+import io.kestra.core.models.executions.LogEntry;
+import io.kestra.core.models.flows.State;
+import io.kestra.core.queues.DispatchQueueInterface;
+import io.kestra.core.queues.QueueException;
+import io.kestra.core.runners.TestRunnerUtils;
+import io.kestra.core.runners.VariableRenderer;
+import io.kestra.core.services.TaskOutputService;
+import io.kestra.core.utils.TestsUtils;
+
+import io.micronaut.test.annotation.MockBean;
+import jakarta.inject.Inject;
+
+import static io.kestra.core.tenant.TenantService.MAIN_TENANT;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @KestraTest(startRunner = true)
 public class SecretFunctionTest {
 
     @Inject
-    @Named(QueueFactoryInterface.WORKERTASKLOG_NAMED)
-    QueueInterface<LogEntry> logQueue;
+    DispatchQueueInterface<LogEntry> logQueue;
 
     @Inject
     private TestRunnerUtils runnerUtils;
@@ -49,26 +48,28 @@ public class SecretFunctionTest {
     @Inject
     VariableRenderer variableRenderer;
 
+    @Inject
+    TaskOutputService taskOutputService;
+
     @Test
-    @LoadFlows({"flows/valids/secrets.yaml"})
+    @LoadFlows({ "flows/valids/secrets.yaml" })
     @EnabledIfEnvironmentVariable(named = "SECRET_MY_SECRET", matches = ".*")
     @EnabledIfEnvironmentVariable(named = "SECRET_NEW_LINE", matches = ".*")
-    void getSecret() throws TimeoutException, QueueException {
+    void getSecret() throws TimeoutException, QueueException, InternalException {
         List<LogEntry> logs = new CopyOnWriteArrayList<>();
-        Flux<LogEntry> receive = TestsUtils.receive(logQueue, either -> logs.add(either.getLeft()));
+        logQueue.addListener(logs::add);
 
         Execution execution = runnerUtils.runOne(MAIN_TENANT, "io.kestra.tests", "secrets");
-        assertThat(execution.getTaskRunList().getFirst().getOutputs().get("value")).isEqualTo("secretValue");
-        assertThat(execution.getTaskRunList().get(2).getOutputs().get("value")).isEqualTo("passwordveryveryveyrlongpasswordveryveryveyrlongpasswordveryveryveyrlongpasswordveryveryveyrlongpasswordveryveryveyrlong");
-        assertThat(execution.getTaskRunList().get(3).getOutputs().get("value")).isEqualTo("secretValue");
-        assertThat(execution.getTaskRunList().get(4).getOutputs()).isEmpty();
+        assertThat(taskOutputService.getOutputs(execution.getTaskRunList().getFirst()).get("value")).isEqualTo("secretValue");
+        assertThat(taskOutputService.getOutputs(execution.getTaskRunList().get(2)).get("value"))
+            .isEqualTo("passwordveryveryveyrlongpasswordveryveryveyrlongpasswordveryveryveyrlongpasswordveryveryveyrlongpasswordveryveryveyrlong");
+        assertThat(taskOutputService.getOutputs(execution.getTaskRunList().get(3)).get("value")).isEqualTo("secretValue");
+        assertThat(taskOutputService.getOutputs(execution.getTaskRunList().get(4))).isEmpty();
         assertThat(execution.getTaskRunList().get(4).getState().getCurrent()).isEqualTo(State.Type.WARNING);
 
         LogEntry matchingLog = TestsUtils.awaitLog(logs, logEntry -> logEntry.getTaskId() != null && logEntry.getTaskId().equals("log-secret"));
-        receive.blockLast();
         assertThat(matchingLog.getMessage()).contains("***");
     }
-
 
     @Test
     void shouldGetSecretGivenExistingSubKey() throws IllegalVariableEvaluationException {
@@ -93,7 +94,8 @@ public class SecretFunctionTest {
         );
 
         // When / Then
-        Throwable cause = Assertions.assertThrows(IllegalVariableEvaluationException.class, () -> {
+        Throwable cause = Assertions.assertThrows(IllegalVariableEvaluationException.class, () ->
+        {
             variableRenderer.render("{{ secret('json-secret', subkey='missing') }}", context);
         }).getCause();
         assertThat(cause.getMessage()).isEqualTo("Cannot find secret sub-key 'missing' in secret 'json-secret'. ({{ secret('json-secret', subkey='missing') }}:1)");
@@ -107,10 +109,144 @@ public class SecretFunctionTest {
         );
 
         // When / Then
-        Throwable cause = Assertions.assertThrows(IllegalVariableEvaluationException.class, () -> {
+        Throwable cause = Assertions.assertThrows(IllegalVariableEvaluationException.class, () ->
+        {
             variableRenderer.render("{{ secret('string-secret', subkey='???') }}", context);
         }).getCause();
-        assertThat(cause.getMessage()).isEqualTo("Failed to read secret sub-key '???' from secret 'string-secret'. Ensure the secret contains valid JSON value. ({{ secret('string-secret', subkey='???') }}:1)");
+        assertThat(cause.getMessage())
+            .isEqualTo("Failed to read secret sub-key '???' from secret 'string-secret'. Ensure the secret contains valid JSON value. ({{ secret('string-secret', subkey='???') }}:1)");
+    }
+
+    @Test
+    void shouldGetSecretGivenFull() throws IllegalVariableEvaluationException {
+        // Given
+        Map<String, Object> context = Map.of(
+            "flow", Map.of("namespace", "io.kestra.unittest")
+        );
+
+        // When / Then
+        // structured secret manager: value plus metadata
+        assertThat(variableRenderer.render("{{ secret('credential', full=true).value }}", context)).isEqualTo("my-password");
+        assertThat(variableRenderer.render("{{ secret('credential', full=true).metadata.username }}", context)).isEqualTo("my-user");
+        assertThat(variableRenderer.render("{{ secret('credential', full=true).metadata.domain }}", context)).isEqualTo("kestra-io");
+
+        // single-value secret: only value, no metadata
+        assertThat(variableRenderer.render("{{ secret('string-secret', full=true).value }}", context)).isEqualTo("string-value");
+    }
+
+    @Test
+    void shouldFailedGivenBothSubKeyAndFull() {
+        // Given
+        Map<String, Object> context = Map.of(
+            "flow", Map.of("namespace", "io.kestra.unittest")
+        );
+
+        // When / Then
+        Throwable cause = Assertions.assertThrows(IllegalVariableEvaluationException.class, () ->
+        {
+            variableRenderer.render("{{ secret('json-secret', subkey='string', full=true) }}", context);
+        }).getCause();
+        assertThat(cause.getMessage())
+            .isEqualTo("The 'secret' function cannot be called with both 'subkey' and 'full' arguments. ({{ secret('json-secret', subkey='string', full=true) }}:1)");
+    }
+
+    @Test
+    void shouldFailedGivenNonExistingSecretUsingDefaults() {
+        // Given
+        Map<String, Object> context = Map.of(
+            "flow", Map.of("namespace", "io.kestra.unittest")
+        );
+
+        // When / Then
+        Throwable cause = Assertions.assertThrows(IllegalVariableEvaluationException.class, () ->
+        {
+            variableRenderer.render("{{ secret('missing-secret') }}", context);
+        }).getCause();
+        assertThat(cause.getMessage()).isEqualTo("Cannot find secret for key 'missing-secret'. ({{ secret('missing-secret') }}:1)");
+    }
+
+    @Test
+    void shouldFailedGivenNonExistingSecretAndErrorOnMissingTrue() {
+        // Given
+        Map<String, Object> context = Map.of(
+            "flow", Map.of("namespace", "io.kestra.unittest")
+        );
+
+        // When / Then
+        Throwable cause = Assertions.assertThrows(IllegalVariableEvaluationException.class, () ->
+        {
+            variableRenderer.render("{{ secret('missing-secret', errorOnMissing=true) }}", context);
+        }).getCause();
+        assertThat(cause.getMessage())
+            .isEqualTo("Cannot find secret for key 'missing-secret'. ({{ secret('missing-secret', errorOnMissing=true) }}:1)");
+    }
+
+    @Test
+    void shouldGetEmptyGivenNonExistingSecretAndErrorOnMissingFalse() throws IllegalVariableEvaluationException {
+        // Given
+        Map<String, Object> context = Map.of(
+            "flow", Map.of("namespace", "io.kestra.unittest")
+        );
+
+        // When / Then
+        assertThat(variableRenderer.render("{{ secret('missing-secret', errorOnMissing=false) }}", context)).isEqualTo("");
+    }
+
+    @Test
+    void shouldGetEmptyGivenNonExistingSecretAndFullAndErrorOnMissingFalse() throws IllegalVariableEvaluationException {
+        // Given
+        Map<String, Object> context = Map.of(
+            "flow", Map.of("namespace", "io.kestra.unittest")
+        );
+
+        // When / Then
+        assertThat(variableRenderer.render("{{ secret('missing-secret', full=true, errorOnMissing=false) }}", context)).isEqualTo("");
+    }
+
+    @Test
+    void shouldGetEmptyGivenNonExistingSecretAndSubKeyAndErrorOnMissingFalse() throws IllegalVariableEvaluationException {
+        // Given
+        Map<String, Object> context = Map.of(
+            "flow", Map.of("namespace", "io.kestra.unittest")
+        );
+
+        // When / Then
+        // the secret itself is absent, so it is tolerated before any sub-key lookup is attempted.
+        assertThat(variableRenderer.render("{{ secret('missing-secret', subkey='x', errorOnMissing=false) }}", context)).isEqualTo("");
+    }
+
+    @Test
+    void shouldFailedGivenNonExistingSubKeyAndErrorOnMissingFalse() {
+        // Given
+        Map<String, Object> context = Map.of(
+            "flow", Map.of("namespace", "io.kestra.unittest")
+        );
+
+        // When / Then
+        // 'errorOnMissing' tolerates a missing secret, not a missing sub-key of an existing one.
+        Throwable cause = Assertions.assertThrows(IllegalVariableEvaluationException.class, () ->
+        {
+            variableRenderer.render("{{ secret('json-secret', subkey='missing', errorOnMissing=false) }}", context);
+        }).getCause();
+        assertThat(cause.getMessage())
+            .isEqualTo("Cannot find secret sub-key 'missing' in secret 'json-secret'. ({{ secret('json-secret', subkey='missing', errorOnMissing=false) }}:1)");
+    }
+
+    @Test
+    void shouldFailedGivenSecretBackendFailureAndErrorOnMissingFalse() {
+        // Given
+        Map<String, Object> context = Map.of(
+            "flow", Map.of("namespace", "io.kestra.unittest")
+        );
+
+        // When / Then
+        // A backend failure is not a missing secret: it must surface even when 'errorOnMissing' is false.
+        Throwable cause = Assertions.assertThrows(IllegalVariableEvaluationException.class, () ->
+        {
+            variableRenderer.render("{{ secret('backend-failure', errorOnMissing=false) }}", context);
+        }).getCause();
+        assertThat(cause.getMessage())
+            .isEqualTo("Secret backend is unavailable. ({{ secret('backend-failure', errorOnMissing=false) }}:1)");
     }
 
     @Test
@@ -134,12 +270,29 @@ public class SecretFunctionTest {
                 """,
             "io.kestra.unittest.string-secret", "string-value"
         );
+
         public String findSecret(String tenantId, String namespace, String key) throws SecretNotFoundException, IOException {
+            if ("backend-failure".equals(key)) {
+                // a secret backend that is reachable but failing: a SecretException that is not a SecretNotFoundException
+                throw new SecretException("Secret backend is unavailable.");
+            }
+
             Optional<String> optional = Optional.ofNullable(SECRETS.get(namespace + "." + key));
             if (optional.isPresent()) {
                 return optional.get();
             }
             return super.findSecret(tenantId, namespace, key);
+        }
+
+        @Override
+        public SecretObject findSecretObject(String tenantId, String namespace, String key) throws SecretNotFoundException, IOException {
+            if ("credential".equals(key)) {
+                Map<String, String> metadata = new LinkedHashMap<>();
+                metadata.put("username", "my-user");
+                metadata.put("domain", "kestra-io");
+                return new SecretObject("my-password", metadata);
+            }
+            return super.findSecretObject(tenantId, namespace, key);
         }
     }
 }

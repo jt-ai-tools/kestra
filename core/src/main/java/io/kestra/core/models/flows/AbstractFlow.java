@@ -1,11 +1,21 @@
 package io.kestra.core.models.flows;
 
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+
 import io.kestra.core.models.Label;
-import io.kestra.core.models.tasks.WorkerGroup;
+import io.kestra.core.models.annotations.PluginProperty;
+import io.kestra.core.models.tasks.WorkerSelector;
+import io.kestra.core.serializers.Jackson3ListOrMapOfLabelDeserializer;
+import io.kestra.core.serializers.Jackson3ListOrMapOfLabelSerializer;
 import io.kestra.core.serializers.ListOrMapOfLabelDeserializer;
 import io.kestra.core.serializers.ListOrMapOfLabelSerializer;
+import io.kestra.core.validations.TenantId;
+
 import io.swagger.v3.oas.annotations.Hidden;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
@@ -14,10 +24,6 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.experimental.SuperBuilder;
-
-import java.time.Instant;
-import java.util.List;
-import java.util.Map;
 
 @SuperBuilder(toBuilder = true)
 @Getter
@@ -43,14 +49,21 @@ public abstract class AbstractFlow implements FlowInterface {
 
     String description;
 
-    @Valid
-    List<Input<?>> inputs;
+    List<@Valid Input<?>> inputs;
 
-    @Valid
-    List<Output> outputs;
+    @Schema(
+        title = "Output values available and exposes to other flows.",
+        description = "Output values make information about the execution of your Flow available and expose for other Kestra flows to use. Output values are similar to return values in programming languages."
+    )
+    @PluginProperty(dynamic = true)
+    List<@Valid Output> outputs;
 
     @NotNull
     @Builder.Default
+    @Schema(
+        title = "Whether the flow is disabled.",
+        description = "A disabled flow does not run: its triggers are paused and new executions are rejected."
+    )
     boolean disabled = false;
 
     @Getter
@@ -58,12 +71,21 @@ public abstract class AbstractFlow implements FlowInterface {
     @Builder.Default
     boolean deleted = false;
 
+    @NotNull
+    @Builder.Default
+    @Schema(
+        description = "Whether this flow revision is a draft. Draft revisions are skipped when an execution starts without an explicit revision (webhooks, schedules, subflows, manual triggers). Executions can still target a draft by passing the revision explicitly."
+    )
+    boolean draft = false;
+
     @Hidden
-    @Pattern(regexp = "^[a-z0-9][a-z0-9_-]*")
+    @TenantId
     String tenantId;
 
     @JsonSerialize(using = ListOrMapOfLabelSerializer.class)
     @JsonDeserialize(using = ListOrMapOfLabelDeserializer.class)
+    @tools.jackson.databind.annotation.JsonSerialize(using = Jackson3ListOrMapOfLabelSerializer.class)
+    @tools.jackson.databind.annotation.JsonDeserialize(using = Jackson3ListOrMapOfLabelDeserializer.class)
     @Schema(
         description = "Labels as a list of Label (key/value pairs) or as a map of string to string.",
         implementation = Object.class,
@@ -72,8 +94,7 @@ public abstract class AbstractFlow implements FlowInterface {
             Map.class
         }
     )
-    @Valid
-    List<Label> labels;
+    List<@Valid Label> labels;
 
     @Schema(
         type = "object",
@@ -81,8 +102,7 @@ public abstract class AbstractFlow implements FlowInterface {
     )
     Map<String, Object> variables;
 
-
     @Valid
-    private WorkerGroup workerGroup;
-
+    @Schema(description = "Routing requirements (tags + fallback) for this flow.")
+    private WorkerSelector workerSelector;
 }

@@ -1,20 +1,18 @@
 package io.kestra.core.models.hierarchies;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import io.kestra.core.models.executions.TaskRun;
-import io.kestra.core.models.tasks.TaskInterface;
 import io.kestra.core.models.tasks.TaskForExecution;
-import io.micronaut.core.annotation.Introspected;
+import io.kestra.core.models.tasks.TaskInterface;
+
 import lombok.Getter;
 import lombok.Setter;
 import lombok.ToString;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Objects;
-
 @ToString
 @Getter
-@Introspected
 public abstract class AbstractGraphTask extends AbstractGraph {
     @Setter
     private TaskInterface task;

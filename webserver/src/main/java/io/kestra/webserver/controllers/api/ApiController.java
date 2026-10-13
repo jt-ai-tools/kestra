@@ -5,10 +5,8 @@ import io.micronaut.http.HttpResponse;
 import io.micronaut.http.MediaType;
 import io.micronaut.http.annotation.Controller;
 import io.micronaut.http.annotation.Get;
-import io.micronaut.validation.Validated;
 import io.swagger.v3.oas.annotations.Hidden;
 
-@Validated
 @Controller("/api")
 public class ApiController {
     @Value("${micronaut.server.context-path:}")
@@ -49,7 +47,7 @@ public class ApiController {
             "    schema-style=\"table\"\n" +
             "    regular-font='Ubuntu'\n" +
             "  >\n" +
-            "    <img src=\"" + getBasePath() + "/static/logo.svg\" slot=\"nav-logo\" alt=\"logo\" />\n" +
+            "    <img src=\"" + getBasePath() + "/static/logo-white.svg\" slot=\"nav-logo\" alt=\"logo\" />\n" +
             "\n" +
             "  </rapi-doc>\n" +
             "  <script>\n" +

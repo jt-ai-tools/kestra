@@ -1,12 +1,12 @@
 package io.kestra.core.plugins;
 
-import org.junit.jupiter.api.Test;
-
 import java.net.URISyntaxException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
 import java.util.Objects;
+
+import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -32,5 +32,16 @@ class PluginScannerTest {
         PluginScanner pluginScanner = new PluginScanner(PluginScannerTest.class.getClassLoader());
         RegisteredPlugin scan = pluginScanner.scan();
         assertThat(scan.getManifest().getMainAttributes().getValue("X-Kestra-Group")).isEqualTo("io.kestra.plugin.core");
+    }
+
+    @Test
+    void shouldDiscoverPluginEndpoints() {
+        PluginScanner pluginScanner = new PluginScanner(PluginScannerTest.class.getClassLoader());
+
+        RegisteredPlugin core = pluginScanner.scan();
+
+        assertThat(core.getEndpoints())
+            .anySatisfy(endpoint -> assertThat(endpoint)
+                .isInstanceOf(io.kestra.core.plugins.endpoint.TestScanEndpoint.class));
     }
 }

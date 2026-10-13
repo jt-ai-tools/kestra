@@ -4,6 +4,7 @@
         lang="yaml"
         :revisions="flowRevisions"
         :revisionSource="loadRevisionContent"
+        :highlight="route.query.revisionHighlight?.toString()"
         @restore="restoreRevision"
         @deleted="onRevisionDeleted"
         class="flow-revisions"
@@ -15,94 +16,121 @@
 </template>
 
 <script setup lang="ts">
-    import {computed, onMounted, ref, watch} from "vue";
-    import {useRoute, useRouter} from "vue-router";
-    import Crud from "override/components/auth/Crud.vue";
-    import Revisions from "../layout/Revisions.vue";
+    import {computed, onMounted, ref, watch} from "vue"
+    import {useRoute, useRouter} from "vue-router"
+    import {useI18n} from "vue-i18n"
+    import {asProblem} from "@kestra-io/kestra-sdk"
+    import Crud from "override/components/auth/Crud.vue"
+    import Revisions from "../layout/Revisions.vue"
 
-    import {useToast} from "../../utils/toast";
-    import {useFlowStore} from "../../stores/flow";
-    const route = useRoute();
-    const router = useRouter();
-    const toast = useToast();
+    import {useToast} from "../../utils/toast"
+    import {useFlowStore} from "../../stores/flow"
+    import {isReportedCentrally, type KestraHttpError} from "../../utils/kestraHttp"
+    const route = useRoute()
+    const router = useRouter()
+    const toast = useToast()
+    const {t} = useI18n()
 
-    const flowStore = useFlowStore();
-    const flow = computed(() => flowStore.flow);
-    const storeRevisions = computed(() => flowStore.revisions);
+    const flowStore = useFlowStore()
+    const flow = computed(() => flowStore.flow)
+    const storeRevisions = computed(() => flowStore.revisions)
 
     // Load revisions from API only if not already in store
     onMounted(async () => {
         if (flow.value && (!storeRevisions.value || storeRevisions.value.length === 0)) {
             await flowStore.loadRevisions({
                 namespace: flow.value.namespace,
-                id: flow.value.id
-            });
+                id: flow.value.id,
+            })
         }
-    });
+    })
 
     // Watch for flow changes to reload revisions
     watch(flow, async (newFlow) => {
         if (newFlow && (!storeRevisions.value || storeRevisions.value.length === 0)) {
             await flowStore.loadRevisions({
                 namespace: newFlow.namespace,
-                id: newFlow.id
-            });
+                id: newFlow.id,
+            })
         }
-    });
+    })
 
-    const revisions = ref<Array<{revision: number}>>([]);
+    const revisions = ref<Array<{revision: number}>>([])
 
     async function fetchRevisions() {
-        const namespace = (route.params.namespace as string) ?? "";
-        const id = (route.params.id as string) ?? "";
+        const namespace = (route.params.namespace as string) ?? ""
+        const id = (route.params.id as string) ?? ""
         if (!namespace || !id) {
-            revisions.value = [];
-            return;
+            revisions.value = []
+            return
         }
 
         try {
             const loaded = await flowStore.loadRevisions({
                 namespace,
-                id
-            });
-            revisions.value = loaded ?? [];
+                id,
+            })
+            revisions.value = loaded ?? []
         } catch (err) {
-            console.error("Failed to load revisions", err);
-            revisions.value = [];
+            console.error("Failed to load revisions", err)
+            revisions.value = []
         }
     }
 
-    onMounted(fetchRevisions);
+    onMounted(fetchRevisions)
 
     const flowRevisions = computed(() => {
         // Use store revisions if available (includes updated)
         if (storeRevisions.value && storeRevisions.value.length > 0) {
-            return storeRevisions.value;
+            return storeRevisions.value
         }
 
         // Fallback to generating from flow.revision count (no timestamps)
         if (!flow.value) {
-            return revisions.value;
+            return revisions.value
         }
-        return [...Array(flow.value.revision).keys()].map(idx => ({revision: idx + 1}));
+        return [...Array(flow.value.revision).keys()].map(idx => ({revision: idx + 1}))
     })
 
     async function restoreRevision(revisionSource: string) {
-        return flowStore.saveFlow({flow: revisionSource})
-            .then((response:any) => {
-                toast.saved(response.id);
+        if (!flow.value) return
+
+        const {namespace, id, revision: previousRevision} = flow.value
+        const revisionsPath = route.path
+
+        try {
+            const saved = await flowStore.saveFlow({flow: revisionSource})
+            flowStore.initYamlSource().catch(onRestoreError)
+            toast.saved(saved.id)
+
+            const loaded = await flowStore.loadRevisions({namespace, id, store: false})
+            if (flow.value?.namespace !== namespace || flow.value?.id !== id || flow.value?.revision !== saved.revision) return
+
+            flowStore.revisions = loaded
+            revisions.value = loaded
+            if (route.path !== revisionsPath || previousRevision === undefined || saved.revision === undefined || saved.revision === previousRevision) return
+
+            await router.push({
+                query: {
+                    ...route.query,
+                    revisionLeft: previousRevision,
+                    revisionRight: saved.revision,
+                },
             })
-            .then(() => {
-                return flowStore.initYamlSource();
-            })
-            .then(() => {
-                router.push({query: {}});
-            });
+        } catch (error: unknown) {
+            onRestoreError(error)
+        }
+    }
+
+    function onRestoreError(error: unknown) {
+        if (!isReportedCentrally(error as KestraHttpError)) {
+            toast.error(asProblem(error)?.detail ?? t("error"))
+        }
     }
 
     async function loadRevisionContent(revision: number) {
         if (revision === undefined) {
-            return undefined;
+            return undefined
         }
 
         return (await flowStore.loadFlow({
@@ -110,20 +138,20 @@
             id: flow.value?.id ?? "",
             revision: revision.toString(),
             allowDeleted: true,
-            store: false
-        })).source;
+            store: false,
+        })).source
     }
 
     async function onRevisionDeleted(revision: number) {
-        const updatedQuery = {...route.query};
+        const updatedQuery = {...route.query}
         for (const key of ["revisionLeft", "revisionRight"]) {
-            if ((updatedQuery as any)[key]?.toString() === `${revision}`) delete (updatedQuery)[key];
+            if (updatedQuery[key]?.toString() === `${revision}`) delete updatedQuery[key]
         }
-        await router.push({query: updatedQuery});
-        await fetchRevisions();
+        await router.push({query: updatedQuery})
+        await fetchRevisions()
     }
 
-    watch(() => [route.params.namespace, route.params.id], fetchRevisions);
+    watch(() => [route.params.namespace, route.params.id], fetchRevisions)
 </script>
 
 <style scoped lang="scss">

@@ -1,14 +1,15 @@
 package io.kestra.core.validations;
 
-import io.kestra.core.validations.validator.ExecutionsDataFilterValidator;
-import jakarta.validation.Constraint;
-import jakarta.validation.Payload;
-
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 
+import io.kestra.core.validations.validator.ExecutionsDataFilterKPIValidator;
+
+import jakarta.validation.Constraint;
+import jakarta.validation.Payload;
+
 @Retention(RetentionPolicy.RUNTIME)
-@Constraint(validatedBy = ExecutionsDataFilterValidator.class)
+@Constraint(validatedBy = ExecutionsDataFilterKPIValidator.class)
 public @interface ExecutionsDataFilterKPIValidation {
     String message() default "invalid executions data filter";
 

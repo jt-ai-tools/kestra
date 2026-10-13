@@ -1,29 +1,42 @@
-import {computed, ref, watch, type Ref} from "vue";
-import {defineStore} from "pinia";
+import {computed, ref, watch, type Ref} from "vue"
+import {defineStore} from "pinia"
 import {useUrlSearchParams} from "@vueuse/core"
-import * as VueFlowUtils from "@kestra-io/ui-libs/vue-flow-utils"
-import {Execution, useExecutionsStore} from "./executions";
-import {normalize} from "../utils/inputs";
-import {useRoute, useRouter} from "vue-router";
-import {State} from "@kestra-io/ui-libs";
-import {useToast} from "../utils/toast";
-import {useI18n} from "vue-i18n";
-import {Flow, useFlowStore} from "./flow";
-import {useFileExplorerStore} from "./fileExplorer";
-import isEqual from "lodash/isEqual";
+import type {FlowGraph} from "@kestra-io/topology/vue-flow-utils"
+import {Execution, useExecutionsStore} from "./executions"
+import {normalize} from "../utils/inputs"
+import {useRoute, useRouter} from "vue-router"
+import {State, isDeepEqual} from "@kestra-io/design-system"
+import {Flow, isSuccessfulFlowSaveOutcome, useFlowStore} from "./flow"
+import type {FlowForExecution} from "@kestra-io/kestra-sdk"
+import {useFileExplorerStore} from "./fileExplorer"
+import type {KestraHttpError} from "../utils/kestraHttp"
 
-interface ExecutionWithGraph extends Execution {
-    graph?: VueFlowUtils.FlowGraph;
+import {storageKeys} from "../utils/constants"
+// Loaded on demand: this store is reachable from the top nav bar, and statically
+// its graph helpers put Vue Flow and dagre in the bundle every page loads.
+const graphUtils = () => import("@kestra-io/topology/vue-flow-utils")
+
+export interface ExecutionWithGraph extends Execution {
+    graph?: FlowGraph;
 }
+
+/** The execution store's flow requires the flags and tasks that the flow store leaves optional. */
+const forExecution = (flow: Flow): FlowForExecution => ({
+    ...flow,
+    disabled: flow.disabled ?? false,
+    draft: flow.draft ?? false,
+    deleted: flow.deleted ?? false,
+    tasks: flow.tasks ?? [],
+})
 
 export const usePlaygroundStore = defineStore("playground", () => {
 
-    const flowStore = useFlowStore();
+    const flowStore = useFlowStore()
     const params = useUrlSearchParams("history", {
-        removeFalsyValues: true
+        removeFalsyValues: true,
     })
 
-    const enabled = ref<boolean>(params.playground === "on" && localStorage.getItem("editorPlayground") === "true");
+    const enabled = ref<boolean>(params.playground === "on" && localStorage.getItem(storageKeys.EDITOR_PLAYGROUND) !== "false")
     watch(enabled, (newValue) => {
         if (newValue) {
             params.playground = "on"
@@ -32,71 +45,78 @@ export const usePlaygroundStore = defineStore("playground", () => {
         }
     })
 
-    const route = useRoute();
-    const router = useRouter();
+    const route = useRoute()
+    const router = useRouter()
 
     function navigateToEdit(runUntilTaskId?: string, runDownstreamTasks?: boolean) {
-        const flowParsed = flowStore.flow;
-        router.push({
-            name: "flows/update",
+        const flowParsed = flowStore.flow
+        return router.push({
+            name: "flows/update/edit",
             params: {
                 id: flowParsed?.id,
                 namespace: flowParsed?.namespace,
-                tab: "edit",
                 tenant: route.params.tenant,
             },
             query: {
                 playground: "on",
                 runUntilTaskId,
                 runDownstreamTasks: runDownstreamTasks ? "true" : undefined,
-            }
-        });
+            },
+        })
     }
 
     const executions = ref([]) as Ref<ExecutionWithGraph[]>
-    function addExecution(execution: ExecutionWithGraph, graph: VueFlowUtils.FlowGraph) {
+    function addExecution(execution: ExecutionWithGraph, graph?: FlowGraph) {
         execution.graph = graph
-        executions.value.unshift(execution);
+        executions.value.unshift(execution)
     }
 
     function clearExecutions() {
-        executions.value = [];
-        executionsStore.execution = undefined;
+        executions.value = []
+        executionsStore.execution = undefined
     }
 
-    const executionsStore = useExecutionsStore();
+    const executionsStore = useExecutionsStore()
 
-    const taskIdToTaskRunIdMap: Map<string, string>  = new Map();
+    const taskIdToTaskRunIdMap: Map<string, string>  = new Map()
 
-    async function triggerExecution(flow: Flow, breakpoints?: string[]) {
-        const defaultInputValues: Record<string, any> = {}
-        for (const input of (flow.inputs || [])) {
-            const {type, defaults} = input;
-            // for dates, no need to normalize the value
-            // https://github.com/kestra-io/kestra/issues/10576
-            const safeDef = type === "DATE"
-                ? defaults
-                : normalize(type, defaults);
+    async function triggerExecution(flow: Flow, breakpoints?: string[], customFormData?: Record<string, unknown>) {
+        let formData = customFormData
+        if (!formData) {
+            formData = {}
+            const lastExecution = executions.value.length ? executions.value[0] : undefined
+            const lastInputs = lastExecution?.inputs || {}
 
-            if(safeDef !== undefined) {
-                defaultInputValues[input.id] = safeDef;
+            for (const input of (flow.inputs || [])) {
+                const {type, defaults, id} = input
+                const valueToUse = lastInputs[id] !== undefined ? lastInputs[id] : defaults
+
+                // for dates and times, no need to normalize the value
+                // https://github.com/kestra-io/kestra/issues/10576
+                const safeDef = (type === "DATE" || type === "TIME")
+                    ? valueToUse
+                    : normalize(type, valueToUse)
+
+                if(safeDef !== undefined) {
+                    formData[id] = safeDef
+                }
             }
         }
 
         return executionsStore.triggerExecution({
             id: flow.id,
             namespace: flow.namespace,
-            formData: defaultInputValues,
+            formData,
             kind: "PLAYGROUND",
             breakpoints,
+            // Explicit revision so drafts run too - the backend otherwise resolves the latest published one.
+            revision: flow.revision,
         })
     }
 
-    async function replayOrTriggerExecution(taskId?: string, breakpoints?: string[], graph?: any) {
-        const lastExecution = executions.value.length ? executions.value[0] : undefined;
+    async function checkCanReplay(taskId?: string, graph?: FlowGraph) {
+        const lastExecution = executions.value.length ? executions.value[0] : undefined
 
-        // check that the inputs and labels have not changed between the last execution and the current flow
-        // if they have changed, we cannot replay the execution and must trigger a new one
         if(lastExecution && lastExecution.flowRevision && flowStore.flow?.revision
             && lastExecution.flowRevision < flowStore.flow.revision){
             const lastExecutionFlow = await flowStore.loadFlow({
@@ -106,60 +126,75 @@ export const usePlaygroundStore = defineStore("playground", () => {
                 store: false,
             })
 
-            if(!isEqual(lastExecutionFlow.inputs, flowStore.flow.inputs)
-                || !isEqual(lastExecutionFlow.labels, flowStore.flow.labels)){
-                return await triggerExecution(flowStore.flow, breakpoints);
+            if(!isDeepEqual(lastExecutionFlow.inputs, flowStore.flow.inputs)
+                || !isDeepEqual(lastExecutionFlow.labels, flowStore.flow.labels)
+                || !isDeepEqual(lastExecutionFlow.variables, flowStore.flow.variables)){
+                return false
             };
         }
 
-        // if all tasks prior to current task in the graph are identical
-        // to the previous execution's revision,
-        // we can skip them and start the execution at the current task using replayExecution()
         if (lastExecution && taskId && graph
             && lastExecution.graph
-            && VueFlowUtils.areTasksIdenticalInGraphUntilTask(lastExecution.graph, graph, taskId)
+            && (await graphUtils()).areTasksIdenticalInGraphUntilTask(lastExecution.graph, graph, taskId)
             && taskIdToTaskRunIdMap.has(taskId)) {
+            return true
+        }
+
+        return false
+    }
+
+    async function replayOrTriggerExecution(taskId?: string, breakpoints?: string[], graph?: FlowGraph, customFormData?: Record<string, unknown>) {
+        const canReplay = await checkCanReplay(taskId, graph)
+        const lastExecution = executions.value.length ? executions.value[0] : undefined
+
+        if (canReplay && lastExecution && taskId) {
             return await executionsStore.replayExecution({
                 executionId: lastExecution.id,
                 taskRunId: taskIdToTaskRunIdMap.get(taskId),
                 revision: flowStore.flow?.revision,
                 breakpoints,
-            });
+            })
         }
 
         if(!flowStore.flow) {
-            console.warn("Flow is not defined, cannot trigger execution");
-            return;
+            console.warn("Flow is not defined, cannot trigger execution")
+            return
         }
 
-        return await triggerExecution(flowStore.flow, breakpoints);
+        return await triggerExecution(flowStore.flow, breakpoints, customFormData)
     }
 
     async function getNextTaskIds(taskId?: string) {
         if(!flowStore.flow) {
-            console.warn("Flow is not defined, cannot get next task IDs");
-            return {nextTasksIds: [], graph: undefined};
+            console.warn("Flow is not defined, cannot get next task IDs")
+            return {nextTasksIds: [], graph: undefined}
         }
 
-        const graph = await flowStore.loadGraph({flow: flowStore.flow});
+        const graph = await flowStore.loadGraph({flow: flowStore.flow})
 
-        if (!taskId) {
-            return {nextTasksIds: [], graph};
+        if (!taskId || !graph) {
+            return {nextTasksIds: [], graph}
         }
 
         // find the node uid of the task with the given taskId
-        const taskNode = graph.nodes.find((node: any) => node?.task?.id === taskId);
+        const taskNode = graph.nodes.find((node) => node.task?.id === taskId)
 
-        const nextTasksNodes = VueFlowUtils.getNextTaskNodes(graph, taskNode);
+        if (!taskNode) {
+            return {nextTasksIds: [], graph}
+        }
 
-        const nextTasksIds = nextTasksNodes.map((node: any) => node.task.id);
+        const nextTasksNodes = (await graphUtils()).getNextTaskNodes(graph, taskNode)
 
-        return {nextTasksIds, graph};
+        const nextTasksIds = nextTasksNodes
+            .map((node) => node.task?.id)
+            .filter((id): id is string => id !== undefined)
+
+        return {nextTasksIds, graph}
     }
 
-    const latestExecution = computed(() => executions.value[0]);
+    const latestExecution = computed(() => executions.value[0])
 
-    const nonFinalStates = [
+    const nonFinalStates: string[] = [
         State.KILLING,
         State.RUNNING,
         State.RESTARTED,
@@ -167,48 +202,52 @@ export const usePlaygroundStore = defineStore("playground", () => {
     ]
 
     const executionState = computed(() => {
-        return latestExecution.value?.state.current;
+        return latestExecution.value?.state.current
     })
 
     const readyToStartPure = computed(()=>{
-        const executionReady = !latestExecution.value || !nonFinalStates.includes(executionState.value);
-        const flowValid = !(flowStore.haveChange && flowStore.flowErrors);
-        return executionReady && flowValid;
+        const executionReady = !latestExecution.value || !nonFinalStates.includes(executionState.value)
+        const flowValid = !(flowStore.haveChange && flowStore.flowErrors)
+        return executionReady && flowValid
     })
 
-    const readyToStart = ref(readyToStartPure.value);
+    const executionSettled = ref(readyToStartPure.value)
     watch(readyToStartPure, (newValue) => {
         if(newValue) {
             setTimeout(() => {
-                readyToStart.value = newValue;
-            }, 1000);
+                executionSettled.value = newValue
+            }, 1000)
         } else {
-            readyToStart.value = newValue
+            executionSettled.value = newValue
         }
-    });
+    })
 
-    const toast = useToast();
+    const starting = ref(false)
+    const readyToStart = computed(() => !starting.value && readyToStartPure.value && executionSettled.value)
+
+    const showInputPrompt = ref(false)
+    const actionOptions = ref<{taskId?: string, runDownstreamTasks?: boolean}>()
 
     // Ensure Files panel reflects changes after Playground executions (e.g., Namespace/Tenant sync tasks)
     // When an execution transitions from a non-final state to a final state, refresh the files tree
     // @see https://github.com/kestra-io/plugin-git/issues/188
-    const fileExplorerStore = useFileExplorerStore();
+    const fileExplorerStore = useFileExplorerStore()
     watch(() => executionState.value, (newState, oldState) => {
-        if (!latestExecution.value) return;
+        if (!latestExecution.value) return
 
-        const wasRunning = oldState ? nonFinalStates.includes(oldState) : false;
-        const isFinalNow = newState ? !nonFinalStates.includes(newState) : false;
+        const wasRunning = oldState ? nonFinalStates.includes(oldState) : false
+        const isFinalNow = newState ? !nonFinalStates.includes(newState) : false
 
         if (wasRunning && isFinalNow) {
             // Trigger a refresh of the namespace files tree in the file explorer
-            fileExplorerStore.loadNodes();
+            fileExplorerStore.loadNodes()
         }
-    });
+    })
 
     function runFromQuery(){
         if(route.query.runUntilTaskId) {
-            const {runUntilTaskId, runDownstreamTasks} = route.query;
-            runUntilTask(runUntilTaskId.toString(), Boolean(runDownstreamTasks));
+            const {runUntilTaskId, runDownstreamTasks} = route.query
+            runUntilTask(runUntilTaskId.toString(), Boolean(runDownstreamTasks))
 
             // remove the query parameters to avoid running the same task again
             router.replace({
@@ -218,96 +257,129 @@ export const usePlaygroundStore = defineStore("playground", () => {
                     ...route.query,
                     runUntilTaskId: undefined,
                     runDownstreamTasks: undefined,  // remove the query parameter
-                }
-            });
+                },
+            })
         }
     }
 
-    const {t} = useI18n();
-
-    async function runUntilTask(taskId?: string, runDownstreamTasks = false) {
+    async function runUntilTask(taskId?: string, runDownstreamTasks = false, customFormData?: Record<string, unknown>) {
         if(readyToStart.value === false) {
-            console.warn("Playground is not ready to start, latest execution is still in progress");
+            console.warn("Playground is not ready to start, latest execution is still in progress")
             return
         }
         if (flowStore.haveChange && flowStore.flowErrors) {
-            return;
+            return
         }
-        readyToStart.value = false;
-
-        if(flowStore.isCreating){
-            toast.confirm(
-                t("playground.confirm_create"),
-                async () => {
-                    await flowStore.saveAll();
-                    navigateToEdit(taskId, runDownstreamTasks);
-                }
-            );
-            return;
+        if (flowStore.isCreating) {
+            starting.value = true
+            let outcome
+            try {
+                outcome = await flowStore.saveAsDraft()
+            } finally {
+                starting.value = false
+            }
+            if (isSuccessfulFlowSaveOutcome(outcome)) {
+                await navigateToEdit(taskId, runDownstreamTasks)
+                enabled.value = true
+            }
+            return
         }
+        starting.value = true
+        try {
+            await startRun(taskId, runDownstreamTasks, customFormData)
+        } finally {
+            starting.value = false
+        }
+    }
 
-        await flowStore.saveAll();
+    async function startRun(taskId?: string, runDownstreamTasks = false, customFormData?: Record<string, unknown>) {
+        await flowStore.saveAsDraft()
         // get the next task id to break on. If current task is provided to breakpoint,
         // the task specified by the user will not be executed.
-        const {nextTasksIds, graph} = await getNextTaskIds(runDownstreamTasks ? undefined : taskId) ?? {};
+        const {nextTasksIds, graph} = await getNextTaskIds(runDownstreamTasks ? undefined : taskId) ?? {}
 
-        let execution;
+        const willReplay = await checkCanReplay(taskId, graph)
+        if (!willReplay && !customFormData && flowStore.flow) {
+            // Check if we need to prompt for inputs
+            let hasMissing = false
+            for (const input of (flowStore.flow.inputs || [])) {
+                if (input.required && input.defaults === undefined) {
+                    const lastExecution = executions.value.length ? executions.value[0] : undefined
+                    if (!lastExecution || lastExecution.inputs?.[input.id] === undefined) {
+                        hasMissing = true
+                        break
+                    }
+                }
+            }
+            if (hasMissing) {
+                actionOptions.value = {taskId, runDownstreamTasks}
+                executionsStore.flow = forExecution(flowStore.flow)
+                showInputPrompt.value = true
+                return
+            }
+        }
+
+        let execution: Execution | undefined = undefined
         try {
-            const response = await replayOrTriggerExecution(taskId, runDownstreamTasks ? undefined : nextTasksIds, graph);
-            execution = response?.data;
-        } catch (error: any) {
-            if (error?.response?.status === 422) {
-                // Invalid entity, most likely due to invalid inputs - allow triggering the task again
-                // See: https://github.com/kestra-io/kestra/issues/11109
-                readyToStart.value = true;
+            execution = await replayOrTriggerExecution(taskId, runDownstreamTasks ? undefined : nextTasksIds, graph, customFormData)
+        } catch (error: unknown) {
+            if ((error as KestraHttpError | undefined)?.response?.status === 422) {
+                if (!customFormData && flowStore.flow && flowStore.flow.inputs?.length) {
+                    actionOptions.value = {taskId, runDownstreamTasks}
+                    executionsStore.flow = forExecution(flowStore.flow)
+                    showInputPrompt.value = true
+                    return
+                }
             }
 
-            throw error;
+            throw error
         }
 
         // don't keep taskRunIds from previous executions
         // because of https://github.com/kestra-io/kestra/issues/10462
-        taskIdToTaskRunIdMap.clear();
+        taskIdToTaskRunIdMap.clear()
 
-        executionsStore.execution = execution;
+        executionsStore.execution = execution
 
         if(execution)
-            addExecution(execution, graph);
+            addExecution(execution, graph)
     }
 
     function updateExecution(execution: ExecutionWithGraph) {
-        const index = executions.value.findIndex(e => e.id === execution.id);
+        const index = executions.value.findIndex(e => e.id === execution.id)
         if(execution.taskRunList){
             for(const taskRun of execution.taskRunList) {
                 // map taskId to taskRunId for later use in replayExecution()
-                taskIdToTaskRunIdMap.set(taskRun.taskId, taskRun.id);
+                taskIdToTaskRunIdMap.set(taskRun.taskId, taskRun.id)
             }
         }
         if (index !== -1) {
-            const graph = executions.value[index].graph;
-            execution.graph = graph; // keep the graph reference
-            executions.value[index] = execution;
+            const graph = executions.value[index].graph
+            execution.graph = graph // keep the graph reference
+            executions.value[index] = execution
         }
     }
 
     // when following an execution, the status changes after creation
     watch(() => executionsStore.execution, (newValue) => {
         if (newValue) {
-            updateExecution(newValue);
+            updateExecution(newValue)
         }
     })
 
-    const dropdownOpened = ref<boolean>(false);
+    const dropdownOpened = ref<boolean>(false)
 
     return {
         enabled,
         dropdownOpened,
+        showInputPrompt,
+        actionOptions,
         readyToStart,
         executions,
         latestExecution,
         clearExecutions,
         runUntilTask,
         runFromQuery,
-        executionState
+        executionState,
     }
 })

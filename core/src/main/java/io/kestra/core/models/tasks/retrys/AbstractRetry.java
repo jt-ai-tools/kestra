@@ -1,43 +1,39 @@
 package io.kestra.core.models.tasks.retrys;
 
+import java.time.Duration;
+import java.time.Instant;
+
 import com.fasterxml.jackson.annotation.JsonSubTypes;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
+
 import dev.failsafe.RetryPolicy;
 import dev.failsafe.RetryPolicyBuilder;
-import io.micronaut.core.annotation.Introspected;
+import io.kestra.core.validations.DurationMax;
+
+import org.hibernate.validator.constraints.time.DurationMin;
 import jakarta.validation.constraints.Min;
 import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.experimental.SuperBuilder;
 
-import java.time.Duration;
-import java.time.Instant;
-
 @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "type", visible = true, include = JsonTypeInfo.As.EXISTING_PROPERTY)
-@JsonSubTypes({
-    @JsonSubTypes.Type(value = Constant.class, name = "constant"),
-    @JsonSubTypes.Type(value = Exponential.class, name = "exponential"),
-    @JsonSubTypes.Type(value = Random.class, name = "random")
-})
+@JsonSubTypes(
+    {
+        @JsonSubTypes.Type(value = Constant.class, name = "constant"),
+        @JsonSubTypes.Type(value = Exponential.class, name = "exponential"),
+        @JsonSubTypes.Type(value = Random.class, name = "random")
+    }
+)
 @Getter
 @NoArgsConstructor
 @SuperBuilder
-@Introspected
 public abstract class AbstractRetry {
     abstract public String getType();
 
+    @DurationMax
+    @DurationMin(millis = 1, message = "must be a positive duration")
     private Duration maxDuration;
-
-    @Deprecated(forRemoval = true)
-    public Integer getMaxAttempt() {
-        return maxAttempts;
-    }
-
-    @Deprecated(forRemoval = true)
-    public void setMaxAttempt(@Min(1) Integer maxAttempt) {
-        this.maxAttempts = maxAttempt;
-    }
 
     @Min(1)
     private Integer maxAttempts;
@@ -66,11 +62,12 @@ public abstract class AbstractRetry {
         if (retry != null) {
             return retry.toPolicy();
         }
-        return RetryPolicy.<T>builder().withMaxAttempts(1);
+        return RetryPolicy.<T> builder().withMaxAttempts(1);
     }
 
     public enum Behavior {
         RETRY_FAILED_TASK,
+        RETRY_FLOWABLE,
         CREATE_NEW_EXECUTION
     }
 }

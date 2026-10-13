@@ -3,16 +3,16 @@ import {useScroll, useThrottleFn, useWindowScroll} from "@vueuse/core"
 import {storageKeys} from "../utils/constants"
 
 export function useScrollMemory(keyRef: Ref<string>, elementRef?: Ref<HTMLElement | null>, useWindow = false): {
-    saveData: (value: any, suffix?: string) => void;
-    loadData: <T = any>(suffix?: string, defaultValue?: T) => T | undefined;
+    saveData: (value: unknown, suffix?: string) => void;
+    loadData: <T = unknown>(suffix?: string, defaultValue?: T) => T | undefined;
 } {
     const getStorageKey = (suffix = "") => `${storageKeys.SCROLL_MEMORY_PREFIX}-${keyRef.value}${suffix}`
 
-    const saveToStorage = (value: any, suffix = "") => {
+    const saveToStorage = (value: unknown, suffix = "") => {
         sessionStorage?.setItem(getStorageKey(suffix), JSON.stringify(value))
     }
 
-    const loadFromStorage = <T = any>(suffix = "", defaultValue?: T): T | undefined => {
+    const loadFromStorage = <T = unknown>(suffix = "", defaultValue?: T): T | undefined => {
         const saved = sessionStorage?.getItem(getStorageKey(suffix))
         return saved ? JSON.parse(saved) : defaultValue
     }
@@ -37,7 +37,7 @@ export function useScrollMemory(keyRef: Ref<string>, elementRef?: Ref<HTMLElemen
     } else {
         useScroll(elementRef || ref(null), {
             throttle: 16,
-            onScroll: () => { if (elementRef?.value) throttledSave(elementRef.value.scrollTop) }
+            onScroll: () => { if (elementRef?.value) throttledSave(elementRef.value.scrollTop) },
         })
         watch([keyRef, () => elementRef?.value], ([newKey, newElement]) => {
             if (newElement && newKey) nextTick(restoreScroll)

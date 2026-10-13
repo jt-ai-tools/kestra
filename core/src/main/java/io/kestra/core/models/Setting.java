@@ -1,12 +1,11 @@
 package io.kestra.core.models;
 
+import jakarta.validation.constraints.NotNull;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.ToString;
 import lombok.experimental.SuperBuilder;
-
-import jakarta.validation.constraints.NotNull;
 
 @SuperBuilder
 @ToString
@@ -17,6 +16,7 @@ public class Setting implements HasUID {
     public static final String INSTANCE_UUID = "instance.uuid";
     public static final String INSTANCE_VERSION = "instance.version";
     public static final String INSTANCE_EDITION = "instance.edition";
+    public static final String INSTANCE_PREVIOUS_VERSION = "instance.previous-version";
 
     @NotNull
     private String key;

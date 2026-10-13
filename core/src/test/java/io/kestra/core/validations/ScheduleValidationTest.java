@@ -1,14 +1,16 @@
 package io.kestra.core.validations;
 
-import io.kestra.core.junit.annotations.KestraTest;
+import java.time.Duration;
+import java.util.List;
+
 import org.junit.jupiter.api.Test;
-import io.kestra.plugin.core.trigger.Schedule;
+
+import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.validations.ModelValidator;
 import io.kestra.core.utils.IdUtils;
+import io.kestra.plugin.core.trigger.Schedule;
 
 import jakarta.inject.Inject;
-
-import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -34,6 +36,52 @@ class ScheduleValidationTest {
 
         assertThat(modelValidator.isValid(build).isPresent()).isTrue();
         assertThat(modelValidator.isValid(build).get().getMessage()).contains("invalid cron expression");
+    }
+
+    @Test
+    void shouldRejectUnsatisfiableCronExpressions() {
+        for (String cron : List.of("0 0 30 2 *", "0 0 31 4 *", "0 0 31 6 *")) {
+            Schedule schedule = Schedule.builder()
+                .id(IdUtils.create())
+                .type(Schedule.class.getName())
+                .cron(cron)
+                .build();
+
+            var violation = modelValidator.isValid(schedule);
+
+            assertThat(violation).isPresent();
+            assertThat(violation.get().getMessage()).contains("invalid cron expression", cron);
+        }
+    }
+
+    @Test
+    void shouldNotReportCronValidationForInvalidTimezone() {
+        Schedule schedule = Schedule.builder()
+            .id(IdUtils.create())
+            .type(Schedule.class.getName())
+            .cron("* * * * *")
+            .timezone("Not/AZone")
+            .build();
+
+        var violation = modelValidator.isValid(schedule);
+
+        assertThat(violation).isPresent();
+        assertThat(violation.get().getMessage())
+            .contains("not a valid time-zone ID")
+            .doesNotContain("invalid cron expression");
+    }
+
+    @Test
+    void shouldAcceptSatisfiableCalendarCronExpressions() {
+        for (String cron : List.of("0 0 29 2 *", "0 0 31 1 *", "0 0 30 4 *")) {
+            Schedule schedule = Schedule.builder()
+                .id(IdUtils.create())
+                .type(Schedule.class.getName())
+                .cron(cron)
+                .build();
+
+            assertThat(modelValidator.isValid(schedule)).isEmpty();
+        }
     }
 
     @Test
@@ -69,7 +117,7 @@ class ScheduleValidationTest {
     }
 
     @Test
-    void lateMaximumDelayValidation()  {
+    void lateMaximumDelayValidation() {
         Schedule build = Schedule.builder()
             .id(IdUtils.create())
             .type(Schedule.class.getName())
@@ -78,20 +126,6 @@ class ScheduleValidationTest {
             .build();
 
         assertThat(modelValidator.isValid(build).isPresent()).isFalse();
-    }
-
-    @Test
-    void intervalValidation() {
-        Schedule build = Schedule.builder()
-            .id(IdUtils.create())
-            .type(Schedule.class.getName())
-            .cron("* * * * *")
-            .interval(Duration.ofSeconds(5))
-            .build();
-
-
-        assertThat(modelValidator.isValid(build).isPresent()).isTrue();
-        assertThat(modelValidator.isValid(build).get().getMessage()).contains("interval: must be null");
     }
 
     @Test

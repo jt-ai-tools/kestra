@@ -1,29 +1,33 @@
 package io.kestra.cli.services;
 
-import io.kestra.core.junit.annotations.FlakyTest;
-import io.kestra.core.models.flows.Flow;
-import io.kestra.core.models.flows.GenericFlow;
-import io.kestra.core.repositories.FlowRepositoryInterface;
-import io.kestra.core.utils.Await;
-import io.kestra.core.utils.TestsUtils;
-import io.micronaut.test.extensions.junit5.annotation.MicronautTest;
-import jakarta.inject.Inject;
-import org.apache.commons.io.FileUtils;
-import org.junit.jupiter.api.*;
-
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import org.apache.commons.io.FileUtils;
+import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.io.TempDir;
+
+import io.kestra.core.junit.annotations.FlakyTest;
+import io.kestra.core.junit.annotations.KestraTest;
+import io.kestra.core.models.flows.Flow;
+import io.kestra.core.models.flows.GenericFlow;
+import io.kestra.core.repositories.FlowRepositoryInterface;
+import io.kestra.core.utils.Await;
+import io.kestra.core.utils.TestsUtils;
+
+import jakarta.inject.Inject;
+
 import static io.kestra.core.utils.Rethrow.throwRunnable;
 import static org.assertj.core.api.Assertions.assertThat;
 
-@MicronautTest(environments = {"test", "file-watch"}, transactional = false)
+@KestraTest(environments = { "test", "file-watch" })
 class FileChangedEventListenerTest {
     public static final String FILE_WATCH = "build/file-watch";
     @Inject
@@ -57,7 +61,7 @@ class FileChangedEventListenerTest {
         }
     }
 
-    @FlakyTest
+    @FlakyTest(description = "OS file watcher events are non-deterministic; CI filesystems may delay or batch inotify events")
     @Test
     void test() throws IOException, TimeoutException {
         var tenant = TestsUtils.randomTenant(FileChangedEventListenerTest.class.getSimpleName(), "test");
@@ -96,45 +100,43 @@ class FileChangedEventListenerTest {
         );
     }
 
-    @FlakyTest
     @Test
-    void testWithPluginDefault() throws IOException, TimeoutException {
-        var tenant = TestsUtils.randomTenant(FileChangedEventListenerTest.class.getName(), "testWithPluginDefault");
-        // remove the flow if it already exists
-        flowRepository.findByIdWithSource(tenant, "io.kestra.tests.watch", "pluginDefault").ifPresent(flow -> flowRepository.delete(flow));
-
-        // create a flow with plugin default
-        String pluginDefault = """
-            id: pluginDefault
+    void shouldNotRewriteFileWhenItAlreadyHoldsTheFlowSource(@TempDir Path directory) throws IOException {
+        var tenant = TestsUtils.randomTenant(FileChangedEventListenerTest.class.getSimpleName(), "unchanged");
+        String source = """
+            id: unchanged
             namespace: io.kestra.tests.watch
 
             tasks:
-              - id: helloWithDefault
+              - id: hello
                 type: io.kestra.plugin.core.log.Log
-
-            pluginDefaults:
-              - type: io.kestra.plugin.core.log.Log
-                values:
-                  message: Hello World!
+                message: Hello
             """;
-        GenericFlow genericFlow = GenericFlow.fromYaml(tenant, pluginDefault);
-        Files.write(Path.of(FILE_WATCH + "/" + genericFlow.uidWithoutRevision() + ".yaml"), pluginDefault.getBytes());
-        Await.until(
-            () -> flowRepository.findById(tenant, "io.kestra.tests.watch", "pluginDefault").isPresent(),
-            Duration.ofMillis(100),
-            Duration.ofSeconds(10)
-        );
-        Flow pluginDefaultFlow = flowRepository.findById(tenant, "io.kestra.tests.watch", "pluginDefault").orElseThrow();
-        assertThat(pluginDefaultFlow.getTasks()).hasSize(1);
-        assertThat(pluginDefaultFlow.getTasks().getFirst().getId()).isEqualTo("helloWithDefault");
-        assertThat(pluginDefaultFlow.getTasks().getFirst().getType()).isEqualTo("io.kestra.plugin.core.log.Log");
+        Path file = Files.writeString(directory.resolve("unchanged.yml"), source);
+        FileTime writtenAt = FileTime.fromMillis(0);
+        Files.setLastModifiedTime(file, writtenAt);
 
-        // delete both files
-        Files.delete(Path.of(FILE_WATCH + "/" + genericFlow.uidWithoutRevision() + ".yaml"));
-        Await.until(
-            () -> flowRepository.findById(tenant, "io.kestra.tests.watch", "pluginDefault").isEmpty(),
-            Duration.ofMillis(100),
-            Duration.ofSeconds(10)
-        );
+        fileWatcher.flowToFile(GenericFlow.fromYaml(tenant, source), file);
+
+        assertThat(Files.getLastModifiedTime(file)).isEqualTo(writtenAt);
+    }
+
+    @Test
+    void shouldRewriteFileWhenTheFlowSourceChanged(@TempDir Path directory) throws IOException {
+        var tenant = TestsUtils.randomTenant(FileChangedEventListenerTest.class.getSimpleName(), "changed");
+        Path file = Files.writeString(directory.resolve("changed.yml"), "id: changed\nnamespace: io.kestra.tests.watch\n");
+        String source = """
+            id: changed
+            namespace: io.kestra.tests.watch
+
+            tasks:
+              - id: hello
+                type: io.kestra.plugin.core.log.Log
+                message: Hello
+            """;
+
+        fileWatcher.flowToFile(GenericFlow.fromYaml(tenant, source), file);
+
+        assertThat(Files.readString(file)).isEqualTo(source);
     }
 }

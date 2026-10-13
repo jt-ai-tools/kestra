@@ -1,23 +1,22 @@
-import {computed, ComputedRef} from "vue";
-import {FilterConfiguration, Comparators} from "../utils/filterTypes";
-import permission from "../../../models/permission";
-import action from "../../../models/action";
-import {useNamespacesStore} from "override/stores/namespaces";
-import {useAuthStore} from "override/stores/auth";
-import {useValues} from "../composables/useValues";
-import {useI18n} from "vue-i18n";
-import {useRoute} from "vue-router";
+import {computed, ComputedRef} from "vue"
+import {FilterConfiguration, Comparators} from "@kestra-io/design-system"
+import {useValues} from "../composables/useValues"
+import {useI18n} from "vue-i18n"
+import {useRoute} from "vue-router"
+import {routeFamily} from "../../../utils/routeFamily"
+import {namespaceValueProvider} from "./namespaceValueProvider"
 
+import {storageKeys} from "../../../utils/constants"
 export const useLogFilter = (): ComputedRef<FilterConfiguration> => {
-    const {t} = useI18n();
-    const route = useRoute();
+    const {t} = useI18n()
+    const route = useRoute()
 
     return computed(() => {
         return {
             title: t("filter.titles.log_filters"),
             searchPlaceholder: t("filter.search_placeholders.search_logs"),
             keys: [
-                ...(route.name !== "namespaces/update" && route.name !== "flows/update" ? [
+                ...(routeFamily(route.name) !== "namespaces/update" && routeFamily(route.name) !== "flows/update" ? [
                     {
                         key: "namespace",
                         label: t("filter.namespace.label"),
@@ -29,43 +28,36 @@ export const useLogFilter = (): ComputedRef<FilterConfiguration> => {
                             Comparators.PREFIX,
                         ],
                         valueType: "multi-select" as const,
-                        valueProvider: async () => {
-                            const user = useAuthStore().user;
-                            if (user && user.hasAnyActionOnAnyNamespace(permission.NAMESPACE, action.READ)) {
-                                const namespacesStore = useNamespacesStore();
-                                const namespaces = (await namespacesStore.loadAutocomplete()) as string[];
-                                return [...new Set(namespaces
-                                    .flatMap(namespace => {
-                                        return namespace.split(".").reduce((current: string[], part: string) => {
-                                            const previousCombination = current?.[current.length - 1];
-                                            return [...current, `${(previousCombination ? previousCombination + "." : "")}${part}`];
-                                        }, []);
-                                    }))].map(namespace => ({
-                                        label: namespace,
-                                        value: namespace
-                                    }));
-                            }
-                            return [];
-                        },
-                        searchable: true
+                        valueProvider: namespaceValueProvider(),
+                        searchable: true,
                     },
-                ] : []) as any,
+                ] : []) as FilterConfiguration["keys"],
                 {
                     key: "level",
                     label: t("filter.level_log_executions.label"),
                     description: t("filter.level.description"),
-                    comparators: [Comparators.EQUALS],
-                    valueType: "select",
+                    comparators: [
+                        Comparators.GREATER_THAN_OR_EQUAL_TO,
+                        Comparators.LESS_THAN_OR_EQUAL_TO,
+                        Comparators.IN,
+                        Comparators.NOT_IN,
+                    ],
+                    comparatorLabels: {
+                        [Comparators.GREATER_THAN_OR_EQUAL_TO]: "At or Above",
+                        [Comparators.LESS_THAN_OR_EQUAL_TO]: "At or Below",
+                    },
+                    valueType: "multi-select",
                     valueProvider: async () => {
-                        const {VALUES} = useValues("logs");
-                        return VALUES.LEVELS;
+                        const {VALUES} = useValues("logs")
+                        return VALUES.LEVELS
                     },
                     defaultValue: () => (
                         typeof window !== "undefined"
-                            ? localStorage.getItem("defaultLogLevel") || "INFO"
+                            ? localStorage.getItem(storageKeys.DEFAULT_LOG_LEVEL) || "INFO"
                             : "INFO"
                     ),
-                    visibleByDefault: true
+                    visibleByDefault: true,
+                    colored: true,
                 },
                 {
                     key: "timeRange",
@@ -73,10 +65,11 @@ export const useLogFilter = (): ComputedRef<FilterConfiguration> => {
                     description: t("filter.timeRange_log.description"),
                     comparators: [Comparators.EQUALS],
                     valueType: "select",
+                    groupable: false,
                     valueProvider: async () => {
-                        const {VALUES} = useValues("logs");
-                        return VALUES.RELATIVE_DATE;
-                    }
+                        const {VALUES} = useValues("logs")
+                        return VALUES.RELATIVE_DATE
+                    },
                 },
                 {
                     key: "scope",
@@ -85,10 +78,21 @@ export const useLogFilter = (): ComputedRef<FilterConfiguration> => {
                     comparators: [Comparators.EQUALS, Comparators.NOT_EQUALS],
                     valueType: "radio",
                     valueProvider: async () => {
-                        const {VALUES} = useValues("logs");
-                        return VALUES.SCOPES;
+                        const {VALUES} = useValues("logs")
+                        return VALUES.SCOPES
                     },
-                    showComparatorSelection: false
+                    showComparatorSelection: false,
+                },
+                {
+                    key: "kind",
+                    label: t("filter.kind.label"),
+                    description: t("filter.kind.description"),
+                    comparators: [Comparators.IN],
+                    valueType: "multi-select",
+                    valueProvider: async () => {
+                        const {VALUES} = useValues("logs")
+                        return VALUES.KINDS
+                    },
                 },
                 {
                     key: "triggerId",
@@ -101,11 +105,11 @@ export const useLogFilter = (): ComputedRef<FilterConfiguration> => {
                         Comparators.NOT_EQUALS,
                         Comparators.CONTAINS,
                         Comparators.STARTS_WITH,
-                        Comparators.ENDS_WITH
+                        Comparators.ENDS_WITH,
                     ],
                     valueType: "text",
                 },
-                ...(route.name !== "flows/update" ? [{
+                ...(routeFamily(route.name) !== "flows/update" ? [{
                     key: "flowId",
                     label: t("filter.flowId.label"),
                     description: t("filter.flowId.description"),
@@ -117,8 +121,44 @@ export const useLogFilter = (): ComputedRef<FilterConfiguration> => {
                         Comparators.ENDS_WITH,
                     ],
                     valueType: "text",
-                }] : []) as any,
-            ]
-        };
-    });
-};
+                }] : []) as FilterConfiguration["keys"],
+                {
+                    key: "taskId",
+                    label: t("filter.taskId.label"),
+                    description: t("filter.taskId.description"),
+                    comparators: [
+                        Comparators.EQUALS,
+                        Comparators.NOT_EQUALS,
+                        Comparators.CONTAINS,
+                        Comparators.STARTS_WITH,
+                        Comparators.ENDS_WITH,
+                        Comparators.IN,
+                    ],
+                    valueType: "text",
+                },
+                {
+                    key: "taskRunId",
+                    label: t("filter.taskRunId.label"),
+                    description: t("filter.taskRunId.description"),
+                    comparators: [
+                        Comparators.EQUALS,
+                        Comparators.NOT_EQUALS,
+                        Comparators.IN,
+                    ],
+                    valueType: "text",
+                },
+                {
+                    key: "attemptNumber",
+                    label: t("filter.attemptNumber.label"),
+                    description: t("filter.attemptNumber.description"),
+                    comparators: [
+                        Comparators.EQUALS,
+                        Comparators.NOT_EQUALS,
+                        Comparators.IN,
+                    ],
+                    valueType: "text",
+                },
+            ],
+        }
+    })
+}
