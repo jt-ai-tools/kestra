@@ -147,9 +147,9 @@ runs:
         echo "total=$(jq .total "${RUNNER_TEMP}/trufflehog-comment.json")" >> "$GITHUB_OUTPUT"
 
     - name: TruffleHog - Comment pull request
-      if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.findings.outputs.total != '' }}
+      if: "${{ github.repository == 'kestra-io/kestra' && (!cancelled() && github.event_name == 'pull_request' && steps.findings.outputs.total != '') }}"
       continue-on-error: true
-      uses: kestra-io/actions/actions/comment-update@main
+      uses: kestra-io/actions/actions/comment-update@176fd1157db8717e1a7df8b0090fdabf534433f3
       with:
         github-token: ${{ inputs.github-token }}
         title: "🐷 TruffleHog"
@@ -171,7 +171,7 @@ runs:
     - name: TruffleHog - Report findings to Elastic
       if: ${{ !cancelled() && inputs.elastic-endpoint != '' }}
       continue-on-error: true
-      uses: kestra-io/actions/actions/report-sarif@main
+      uses: kestra-io/actions/actions/report-sarif@176fd1157db8717e1a7df8b0090fdabf534433f3
       with:
         sarif-files: ${{ runner.temp }}/trufflehog.ndjson
         type: misconfigurations

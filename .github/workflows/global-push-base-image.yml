@@ -109,7 +109,7 @@ jobs:
 
       - name: Slack - Notification
         if: ${{ failure() }}
-        uses: kestra-io/actions/composite/slack-status@main
+        uses: kestra-io/actions/composite/slack-status@176fd1157db8717e1a7df8b0090fdabf534433f3
         with:
           webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
           channel: 'C09FF36GKE1'

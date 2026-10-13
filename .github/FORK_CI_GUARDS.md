@@ -21,3 +21,9 @@ Pinned source Git blobs:
 - `composite/scan-trufflehog/action.yml`: `0efa55964a1b1a25469477b4ba5654b912e5c3a4` (mode 100644)
 - `composite/scan-trufflehog/drop-examples.sh`: `9578c7ef8d557b8f049f71266f048bb2406f6b42` (mode 100755)
 - `composite/scan-trufflehog/trufflehog-exclude.txt`: `43ce6e6edf22b677033c71fc164aa93ce17b30a5` (mode 100644)
+
+## Read-only fork CI and transitive pins
+
+The first merged workflow failed GitHub startup validation because the backend reusable requested write scopes above the fork caller's read-only ceiling. The local backend now requests only `contents: read`; no caller or token permissions are expanded. Fork CI keeps the same tests and linters, switches unavailable PR/API report writers to local annotations, logs, step summaries and JUnit artifacts. Upstream-only automatic code/content writers remain guarded.
+
+Five local reusable workflows and five local composite wrappers now freeze the inspected `kestra-io/actions` graph at `176fd1157db8717e1a7df8b0090fdabf534433f3`. Their terminal custom actions use that exact commit; standard third-party action references are unchanged. These copies need deliberate review during future upstream updates. Other jobs that are restricted to the upstream repository remain excluded from fork execution.

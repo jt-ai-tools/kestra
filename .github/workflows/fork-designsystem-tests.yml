@@ -1,0 +1,97 @@
+# Vendored from kestra-io/actions@176fd1157db8717e1a7df8b0090fdabf534433f3; see ../FORK_CI_GUARDS.md.
+name: Frontend - Design System Tests
+
+on:
+  workflow_call:
+    secrets:
+      GITHUB_AUTH_TOKEN:
+        description: "The GitHub Token."
+        required: true
+      OTLP_ENDPOINT:
+        description: 'OTLP endpoint for OpenTelemetry export'
+        required: false
+      OTLP_HEADERS:
+        description: 'OTLP headers for OpenTelemetry export'
+        required: false
+
+env:
+  # to save corepack from itself
+  COREPACK_INTEGRITY_KEYS: 0
+  OTLP_ENDPOINT: ${{ secrets.OTLP_ENDPOINT }}
+
+jobs:
+  test:
+    name: Frontend - Design System Tests
+    runs-on: ubuntu-latest
+    steps:
+      # Run first, before checkout, so setup time is captured by the trace/host metrics.
+      - name: Setup - OpenTelemetry
+        uses: kestra-io/actions/actions/otel-instrument@176fd1157db8717e1a7df8b0090fdabf534433f3
+        if: ${{ env.OTLP_ENDPOINT != '' }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          otlp-endpoint: ${{ secrets.OTLP_ENDPOINT }}
+          otlp-headers: "${{ secrets.OTLP_HEADERS }}"
+          host-metrics-enabled: 'true'
+          service-name: "Github Actions - ${{ github.repository }} - ${{ github.workflow }}"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.x'
+
+      - name: Cache Node Modules
+        id: cache-node-modules
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ui/node_modules
+          key: modules-${{ hashFiles('ui/package-lock.json') }}
+
+      - name: Cache Playwright Binaries
+        id: cache-playwright
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('ui/package-lock.json') }}
+
+      - name: Npm - install
+        if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        working-directory: ui
+        run: npm ci
+    
+      - name: Npm - check types
+        working-directory: ui/packages/design-system
+        run: npm run check:types
+
+      - name: Run front-end unit tests
+        working-directory: ui/packages/design-system
+        run: npm run test:unit -- --coverage
+
+      # Coverage
+      - name: Coverage - Report
+        if: ${{ !cancelled() && env.OTLP_ENDPOINT != '' }}
+        continue-on-error: true
+        uses: ./.github/actions/fork-report-coverage
+        with:
+          github-token: ${{ secrets.GITHUB_AUTH_TOKEN }}
+          coverage-files: 'ui/packages/design-system/coverage/lcov.info'
+          component: design-system
+          elastic-endpoint: ${{ secrets.OTLP_ENDPOINT }}
+          elastic-headers: "${{ secrets.OTLP_HEADERS }}"
+          metadata: |
+            service.name=kestra
+            component=design-system
+
+      - name: Storybook - Install Playwright
+        working-directory: ui/packages/design-system
+        if: steps.cache-playwright.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps
+
+      - name: Run storybook component tests
+        working-directory: ui/packages/design-system
+        run: npm run test:storybook

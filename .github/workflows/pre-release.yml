@@ -18,7 +18,7 @@ on:
 jobs:
   build-artifacts:
     name: Build Artifacts
-    uses: kestra-io/actions/.github/workflows/kestra-oss-build-artifacts.yml@main
+    uses: ./.github/workflows/fork-build-artifacts.yml
     secrets:
       OTLP_ENDPOINT: "${{ github.repository == 'kestra-io/kestra' && (secrets.OTLP_ENDPOINT) || '' }}"
       OTLP_HEADERS: "${{ github.repository == 'kestra-io/kestra' && (secrets.OTLP_HEADERS) || '' }}"
@@ -41,14 +41,14 @@ jobs:
 
   frontend-tests:
     name: Frontend tests
-    uses: kestra-io/actions/.github/workflows/kestra-oss-frontend-tests.yml@main
+    uses: ./.github/workflows/fork-frontend-tests.yml
     if: ${{ github.event.inputs.skip-test == 'false' || github.event.inputs.skip-test == '' }}
     secrets:
       GITHUB_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   design-system-frontend-tests:
     name: Design System Frontend tests
-    uses: kestra-io/actions/.github/workflows/kestra-oss-designsystem-tests.yml@main
+    uses: ./.github/workflows/fork-designsystem-tests.yml
     if: ${{ github.event.inputs.skip-test == 'false' || github.event.inputs.skip-test == '' }}
     secrets:
       GITHUB_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -57,7 +57,7 @@ jobs:
     name: Publish Maven
     needs: [ backend-tests, frontend-tests, design-system-frontend-tests ]
     if: "${{ github.repository == 'kestra-io/kestra' && (!failure() && !cancelled()) }}"
-    uses: kestra-io/actions/.github/workflows/kestra-oss-publish-maven.yml@main
+    uses: kestra-io/actions/.github/workflows/kestra-oss-publish-maven.yml@176fd1157db8717e1a7df8b0090fdabf534433f3
     secrets:
       SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
       SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
@@ -86,7 +86,7 @@ jobs:
         run: cp build/executable/* build/executable/kestra && chmod +x build/executable/kestra
 
       - name: Generate and publish schema
-        uses: kestra-io/actions/composite/kestra/kestra-configuration-schema@main
+        uses: kestra-io/actions/composite/kestra/kestra-configuration-schema@176fd1157db8717e1a7df8b0090fdabf534433f3
         with:
           kestra-version: ${{ github.ref_name }}
           executable-path: build/executable/kestra
@@ -96,7 +96,7 @@ jobs:
 
       - name: Slack - Schema generation failure
         if: failure()
-        uses: kestra-io/actions/composite/slack-status@main
+        uses: kestra-io/actions/composite/slack-status@176fd1157db8717e1a7df8b0090fdabf534433f3
         with:
           webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
           channel: 'C09FF36GKE1'
@@ -105,7 +105,7 @@ jobs:
     name: Github Release
     needs: [build-artifacts, backend-tests, frontend-tests]
     if: "${{ github.repository == 'kestra-io/kestra' && (!failure() && !cancelled()) }}"
-    uses: kestra-io/actions/.github/workflows/kestra-oss-publish-github.yml@main
+    uses: kestra-io/actions/.github/workflows/kestra-oss-publish-github.yml@176fd1157db8717e1a7df8b0090fdabf534433f3
     secrets: inherit
 
   otel-export-trace:
@@ -117,7 +117,7 @@ jobs:
       OTLP_ENDPOINT: ${{ secrets.OTLP_ENDPOINT }}
     steps:
       - name: OpenTelemetry - Export trace
-        uses: kestra-io/actions/actions/otel-export-trace@main
+        uses: kestra-io/actions/actions/otel-export-trace@176fd1157db8717e1a7df8b0090fdabf534433f3
         if: ${{ env.OTLP_ENDPOINT != '' }}
         with:
           mode: export-all

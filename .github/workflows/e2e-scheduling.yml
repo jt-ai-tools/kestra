@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   e2e:
-    uses: kestra-io/actions/.github/workflows/kestra-oss-e2e-tests.yml@main
+    uses: ./.github/workflows/fork-e2e-tests.yml
     secrets:
       OTLP_ENDPOINT: "${{ github.repository == 'kestra-io/kestra' && (secrets.OTLP_ENDPOINT) || '' }}"
       OTLP_HEADERS: "${{ github.repository == 'kestra-io/kestra' && (secrets.OTLP_HEADERS) || '' }}"
@@ -36,7 +36,7 @@ jobs:
       OTLP_ENDPOINT: ${{ secrets.OTLP_ENDPOINT }}
     steps:
       - name: OpenTelemetry - Export trace
-        uses: kestra-io/actions/actions/otel-export-trace@main
+        uses: kestra-io/actions/actions/otel-export-trace@176fd1157db8717e1a7df8b0090fdabf534433f3
         if: ${{ env.OTLP_ENDPOINT != '' }}
         with:
           mode: export-all

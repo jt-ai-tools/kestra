@@ -33,7 +33,7 @@ jobs:
       # Targeting develop branch from develop — async, fire-and-forget full EE CI
       - name: Trigger EE Workflow (develop push, no payload)
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
-        uses: kestra-io/actions/composite/repository-dispatch@main
+        uses: kestra-io/actions/composite/repository-dispatch@176fd1157db8717e1a7df8b0090fdabf534433f3
         with:
           gh-app-id: ${{ secrets.GH_BOT_APP_ID }}
           gh-app-private-key: ${{ secrets.GH_BOT_PRIVATE_KEY }}
@@ -72,7 +72,7 @@ jobs:
   frontend-tests:
     name: Frontend tests
     if: ${{ github.event.inputs.skip-test == 'false' || github.event.inputs.skip-test == '' }}
-    uses: kestra-io/actions/.github/workflows/kestra-oss-frontend-tests.yml@main
+    uses: ./.github/workflows/fork-frontend-tests.yml
     secrets:
       GITHUB_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OTLP_ENDPOINT: "${{ github.repository == 'kestra-io/kestra' && (secrets.OTLP_ENDPOINT) || '' }}"
@@ -81,7 +81,7 @@ jobs:
   design-system-frontend-tests:
     name: Design System Frontend tests
     if: ${{ github.event.inputs.skip-test == 'false' || github.event.inputs.skip-test == '' }}
-    uses: kestra-io/actions/.github/workflows/kestra-oss-designsystem-tests.yml@main
+    uses: ./.github/workflows/fork-designsystem-tests.yml
     secrets:
       GITHUB_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OTLP_ENDPOINT: "${{ github.repository == 'kestra-io/kestra' && (secrets.OTLP_ENDPOINT) || '' }}"
@@ -91,7 +91,7 @@ jobs:
     name: Publish Docker
     needs: [backend-tests, frontend-tests, design-system-frontend-tests]
     if: "${{ github.repository == 'kestra-io/kestra' && (!failure() && !cancelled() && github.ref == 'refs/heads/develop') }}"
-    uses: kestra-io/actions/.github/workflows/kestra-oss-publish-docker.yml@main
+    uses: kestra-io/actions/.github/workflows/kestra-oss-publish-docker.yml@176fd1157db8717e1a7df8b0090fdabf534433f3
     with:
       java-version: 25
       notify-in-slack-release-channel: false
@@ -103,7 +103,7 @@ jobs:
     name: Publish develop Maven
     needs: [ backend-tests, frontend-tests ]
     if: "${{ github.repository == 'kestra-io/kestra' && (!failure() && !cancelled() && github.ref == 'refs/heads/develop') }}"
-    uses: kestra-io/actions/.github/workflows/kestra-oss-publish-maven.yml@main
+    uses: kestra-io/actions/.github/workflows/kestra-oss-publish-maven.yml@176fd1157db8717e1a7df8b0090fdabf534433f3
     secrets:
       SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
       SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
@@ -132,7 +132,7 @@ jobs:
         run: cp build/executable/* build/executable/kestra && chmod +x build/executable/kestra
 
       - name: Generate and publish schema
-        uses: kestra-io/actions/composite/kestra/kestra-configuration-schema@main
+        uses: kestra-io/actions/composite/kestra/kestra-configuration-schema@176fd1157db8717e1a7df8b0090fdabf534433f3
         with:
           kestra-version: develop
           executable-path: build/executable/kestra
@@ -142,7 +142,7 @@ jobs:
 
       - name: Slack - Schema generation failure
         if: failure()
-        uses: kestra-io/actions/composite/slack-status@main
+        uses: kestra-io/actions/composite/slack-status@176fd1157db8717e1a7df8b0090fdabf534433f3
         with:
           webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
           channel: 'C09FF36GKE1'
@@ -159,7 +159,7 @@ jobs:
         if: ${{ contains(needs.*.result, 'failure') }}
       - name: Slack - Notification
         if: ${{ always() && contains(needs.*.result, 'failure') }}
-        uses: kestra-io/actions/composite/slack-status@main
+        uses: kestra-io/actions/composite/slack-status@176fd1157db8717e1a7df8b0090fdabf534433f3
         with:
           webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
           channel: 'C09FF36GKE1'
@@ -174,7 +174,7 @@ jobs:
       OTLP_ENDPOINT: ${{ secrets.OTLP_ENDPOINT }}
     steps:
       - name: OpenTelemetry - Export trace
-        uses: kestra-io/actions/actions/otel-export-trace@main
+        uses: kestra-io/actions/actions/otel-export-trace@176fd1157db8717e1a7df8b0090fdabf534433f3
         if: ${{ env.OTLP_ENDPOINT != '' }}
         with:
           mode: export-all

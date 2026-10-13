@@ -1,0 +1,101 @@
+# Vendored from kestra-io/actions@176fd1157db8717e1a7df8b0090fdabf534433f3; see ../../FORK_CI_GUARDS.md.
+name: 'Trivy Scan'
+description: 'Scan dependencies with trivy on the default branch and releases/*, shipped to Elastic'
+
+# Scans only where the findings are kept: the default branch and releases/*. A pull request or a
+# feature branch is not scanned, so it neither comments nor writes to Elastic. The branch is part of
+# each vulnerability id, so every scanned branch keeps its own state in Elastic.
+
+inputs:
+  scan-type:
+    description: 'Trivy scan type: `fs` for a lockfile or directory (npm package-lock.json), `sbom` for a CycloneDX/SPDX file'
+    required: false
+    default: "fs"
+
+  scan-path:
+    description: 'The file or directory to scan, e.g. ./ui/package-lock.json or build/reports/cyclonedx/bom.json'
+    required: true
+
+  elastic-endpoint:
+    description: 'Elastic ingest endpoint, the OTLP_ENDPOINT secret. Leave empty to skip shipping'
+    required: false
+    default: ''
+
+  elastic-headers:
+    description: 'Elastic ingest headers, the OTLP_HEADERS secret'
+    required: false
+    default: ''
+
+  metadata:
+    description: 'Newline separated key=value pairs added to every finding, e.g. component=plugin. service.name defaults to the repository name and can be overridden here. A dotted key is written at that path, an undotted one lands under labels.'
+    required: false
+    default: ''
+
+  dry-run:
+    description: 'Build the Elastic payload without sending it'
+    required: false
+    default: 'false'
+
+outputs:
+  json-file:
+    description: 'Absolute path to the Trivy JSON report, the one shipped to Elastic'
+    value: ${{ github.workspace }}/trivy-result.json
+
+  sarif-file:
+    description: 'Absolute path to the same report rendered as SARIF'
+    value: ${{ github.workspace }}/trivy-result.sarif
+
+runs:
+  using: composite
+  steps:
+    - name: Trivy - Create custom temp directory
+      if: ${{ (github.ref_name == github.event.repository.default_branch || startsWith(github.ref_name, 'releases/')) }}
+      shell: bash
+      run: |
+        mkdir -p ${{ github.workspace }}/trivy-tmp
+
+    - name: Trivy - Run Trivy scanner
+      if: ${{ (github.ref_name == github.event.repository.default_branch || startsWith(github.ref_name, 'releases/')) }}
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      id: trivy
+      env:
+        TMPDIR: ${{ github.workspace }}/trivy-tmp
+        TRIVY_CACHE_DIR: ${{ github.workspace }}/.trivy-cache
+      with:
+        scan-type: ${{ inputs.scan-type }}
+        scan-ref: ${{ inputs.scan-path }}
+        format: 'json'
+        output: ${{ github.workspace }}/trivy-result.json
+
+    # The scan above already did the work; `convert` re-renders that report rather than scanning a
+    # second time. Only the `sarif-file` output needs it, as report-sarif below reads the JSON.
+    # trivy-action installs the binary via setup-trivy, so it is on PATH here.
+    - name: Trivy - Convert the report to SARIF
+      shell: bash
+      if: ${{ !cancelled() && (github.ref_name == github.event.repository.default_branch || startsWith(github.ref_name, 'releases/')) }}
+      continue-on-error: true
+      run: |
+        set -euo pipefail
+        if ! command -v trivy >/dev/null; then
+          echo "::warning::trivy is not on PATH, skipping the SARIF conversion"
+          exit 0
+        fi
+        trivy convert --quiet --format sarif \
+          --output "${{ github.workspace }}/trivy-result.sarif" \
+          "${{ github.workspace }}/trivy-result.json"
+
+    - name: Trivy - Report findings to Elastic
+      if: ${{ !cancelled() && inputs.elastic-endpoint != '' && steps.trivy.outcome == 'success' }}
+      continue-on-error: true
+      uses: kestra-io/actions/actions/report-sarif@176fd1157db8717e1a7df8b0090fdabf534433f3
+      with:
+        # The native JSON, not the SARIF the composite also produces: SARIF drops the advisory
+        # database, the publication date and the per-vendor CVSS, which the Elastic flyout shows.
+        sarif-files: ${{ github.workspace }}/trivy-result.json
+        type: vulnerabilities
+        elastic-endpoint: ${{ inputs.elastic-endpoint }}
+        elastic-headers: ${{ inputs.elastic-headers }}
+        dry-run: ${{ inputs.dry-run }}
+        metadata: |
+          service.name=${{ github.event.repository.name }}
+          ${{ inputs.metadata }}

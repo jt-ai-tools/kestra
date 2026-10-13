@@ -48,8 +48,8 @@ jobs:
           fi
 
       - name: Update PR comment
-        if: steps.body.outputs.body != ''
-        uses: kestra-io/actions/actions/comment-update@main
+        if: "${{ github.repository == 'kestra-io/kestra' && (steps.body.outputs.body != '') }}"
+        uses: kestra-io/actions/actions/comment-update@176fd1157db8717e1a7df8b0090fdabf534433f3
         env:
           BODY: ${{ steps.body.outputs.body }}
         with:

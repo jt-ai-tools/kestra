@@ -32,11 +32,7 @@ on:
         required: false
 
 permissions:
-  contents: write
-  checks: write
-  actions: read
-  pull-requests: write
-
+  {"contents": "read"}
 env:
   OTLP_ENDPOINT: ${{ secrets.OTLP_ENDPOINT }}
 
@@ -51,7 +47,7 @@ jobs:
     steps:
       # Run first, before checkout, so setup time is captured by the trace/host metrics.
       - name: Setup - OpenTelemetry
-        uses: kestra-io/actions/actions/otel-instrument@main
+        uses: kestra-io/actions/actions/otel-instrument@176fd1157db8717e1a7df8b0090fdabf534433f3
         if: ${{ env.OTLP_ENDPOINT != '' }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -77,7 +73,7 @@ jobs:
         run: docker compose -f docker-compose-ci.yml up -d --wait --wait-timeout 120
 
       # Setup build
-      - uses: kestra-io/actions/composite/setup-build@main
+      - uses: kestra-io/actions/composite/setup-build@176fd1157db8717e1a7df8b0090fdabf534433f3
         name: Setup - Build
         id: build
         with:
@@ -114,7 +110,7 @@ jobs:
       - name: OpenGrep - Static analysis
         id: opengrep
         if: ${{ !cancelled() }}
-        uses: kestra-io/actions/composite/scan-opengrep@main
+        uses: ./.github/actions/fork-scan-opengrep
         with:
           github-token: ${{ secrets.GITHUB_AUTH_TOKEN }}
           elastic-endpoint: ${{ secrets.OTLP_ENDPOINT }}
@@ -147,7 +143,7 @@ jobs:
       - name: Trivy - Scan Java dependencies
         id: trivy
         if: ${{ !cancelled() && steps.sbom.outcome == 'success' && hashFiles('build/sbom/java.json') != '' }}
-        uses: kestra-io/actions/composite/scan-trivy@main
+        uses: ./.github/actions/fork-scan-trivy
         with:
           scan-type: sbom
           scan-path: build/sbom/java.json
@@ -159,7 +155,7 @@ jobs:
             target=java-dependencies
 
       - name: comment PR with test report
-        if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository}}
+        if: "${{ github.repository == 'kestra-io/kestra' && (!cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_AUTH_TOKEN }}
         run: npx --yes @kestra-io/kestra-devtools generateTestReportSummary --only-errors --ci $(pwd)
@@ -173,7 +169,7 @@ jobs:
       # Report Java
       # this will add a failed check if there is tests errors
       - name: Report - Java
-        uses: kestra-io/actions/composite/report-java@main
+        uses: ./.github/actions/fork-report-java
         if: ${{ !cancelled() }}
         with:
           secrets: ${{ toJSON(secrets) }}
@@ -182,7 +178,7 @@ jobs:
       - name: Coverage - Report
         if: ${{ !cancelled() && env.OTLP_ENDPOINT != '' }}
         continue-on-error: true
-        uses: kestra-io/actions/composite/report-coverage@main
+        uses: ./.github/actions/fork-report-coverage
         with:
           github-token: ${{ secrets.GITHUB_AUTH_TOKEN }}
           coverage-files: '**/build/reports/jacoco/**/*.xml'
@@ -192,3 +188,10 @@ jobs:
           metadata: |
             service.name=kestra
             component=backend
+      - name: Preserve fork test reports
+        if: ${{ always() && github.repository != 'kestra-io/kestra' }}
+        uses: actions/upload-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fork-backend-test-reports
+          path: "**/build/test-results/test/TEST-*.xml"
+          if-no-files-found: ignore

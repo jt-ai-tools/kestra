@@ -1,0 +1,173 @@
+# Vendored from kestra-io/actions@176fd1157db8717e1a7df8b0090fdabf534433f3; see ../FORK_CI_GUARDS.md.
+name: Build Artifacts
+
+on:
+  workflow_call:
+    secrets:
+      OTLP_ENDPOINT:
+        description: 'OTLP endpoint for OpenTelemetry export'
+        required: false
+      OTLP_HEADERS:
+        description: 'OTLP headers for OpenTelemetry export'
+        required: false
+      GCP_SERVICE_ACCOUNT:
+        description: 'GCP service account key JSON, for the Maven mirror the plugin catalog is downloaded from. Required when embed-plugins-schema-bundle is true.'
+        required: false
+    inputs:
+      java-version:
+        description: "Java version"
+        type: string
+        default: '21'
+        required: false
+      embed-plugins-schema-bundle:
+        description: 'Generate the KIP-45 plugin schema bundle from the full plugin catalog and embed it in the jar. Off by default: it downloads the whole catalog, so it is worth the minutes on release and develop builds only, never on pull-request builds.'
+        type: boolean
+        default: false
+        required: false
+
+env:
+  OTLP_ENDPOINT: ${{ secrets.OTLP_ENDPOINT }}
+
+jobs:
+  build:
+    name: Build - Artifacts
+    runs-on: ubuntu-latest
+    outputs:
+      docker-tag: ${{ steps.vars.outputs.tag }}
+      docker-artifact-name: ${{ steps.vars.outputs.artifact }}
+    env:
+      PLUGIN_VERSION: ${{ github.event.inputs.plugin-version != null && github.event.inputs.plugin-version || 'LATEST' }}
+    steps:
+      # Run first, before checkout, so setup time is captured by the trace/host metrics.
+      - name: Setup - OpenTelemetry
+        uses: kestra-io/actions/actions/otel-instrument@176fd1157db8717e1a7df8b0090fdabf534433f3
+        if: ${{ env.OTLP_ENDPOINT != '' }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          otlp-endpoint: ${{ secrets.OTLP_ENDPOINT }}
+          otlp-headers: "${{ secrets.OTLP_HEADERS }}"
+          host-metrics-enabled: 'true'
+          gradle-tracing-enabled: 'true'
+          service-name: "Github Actions - ${{ github.repository }} - ${{ github.workflow }}"
+
+      - name: Checkout - Current ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Has no dependency on anything else in this job (a bare curl|bash installer, not even on
+      # the checkout above) — start it now so it overlaps with Setup - Build / npm / Gradle below
+      # instead of blocking right before it's needed. Waited on further down, just before the
+      # first actual kestractl invocation.
+      - name: Schema bundle - Install kestractl
+        id: kestractl
+        background: true
+        if: ${{ inputs.embed-plugins-schema-bundle }}
+        shell: bash
+        # GITHUB_TOKEN: the install script resolves the release through the GitHub REST API,
+        # which is rate-limited per IP for anonymous callers. Runners share egress IPs, so
+        # without a token this step fails with HTTP 403.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/kestra-io/kestractl/main/install-scripts/install.sh | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      # Setup build
+      - uses: kestra-io/actions/composite/setup-build@176fd1157db8717e1a7df8b0090fdabf534433f3
+        name: Setup - Build
+        id: build
+        with:
+          java-enabled: true
+          node-enabled: true
+          java-version: ${{ inputs.java-version }}
+
+      # Npm
+      - name: Setup - Npm install & build
+        shell: bash
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      # Build
+      - name: Gradle - Build
+        shell: bash
+        run: |
+          ./gradlew executableJar --parallel --console=plain
+
+      # ------------------------------------------------------------------------------------------
+      # Plugin schema bundle (KIP-45): embedded in the jar as the /plugins-schema.json classpath
+      # resource, so the flow editor can autocomplete plugin types that are NOT installed, with no
+      # network access at runtime.
+      #
+      # It has to be generated from the full plugin catalog, which is not a build dependency of
+      # Kestra — only a plugin-loaded Kestra can produce it. Hence two passes: the build above
+      # yields a runnable executable, that executable generates the bundle, then the jar is
+      # repackaged with it. The second pass re-runs processResources/jar/shadowJar only, since
+      # compilation is already up to date.
+      # ------------------------------------------------------------------------------------------
+      # Independent of each other — different services, no shared state.
+      - parallel:
+          - name: Schema bundle - Get plugins list
+            id: schema-bundle-plugins
+            if: ${{ inputs.embed-plugins-schema-bundle }}
+            uses: kestra-io/actions/composite/kestra/kestra-plugins-list@176fd1157db8717e1a7df8b0090fdabf534433f3
+            with:
+              kestraVersion: ${{ github.ref_name }}
+
+          - name: Schema bundle - Authenticate to Google Cloud
+            if: ${{ inputs.embed-plugins-schema-bundle }}
+            uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+            with:
+              credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      # Unconditional: `wait:` doesn't accept `if:` (GitHub rejects the combination as an
+      # unrecognized step shape). The background step above already carries the condition —
+      # waiting on it when it was skipped is a no-op.
+      - name: Schema bundle - Wait for kestractl install
+        wait: [kestractl]
+
+      - name: Schema bundle - Download the plugin catalog
+        shell: bash
+        if: ${{ inputs.embed-plugins-schema-bundle }}
+        env:
+          PLUGINS: ${{ steps.schema-bundle-plugins.outputs.plugins }}
+        run: |
+          set -euo pipefail
+          kestractl plugins download "${{ github.ref_name }}" \
+            --maven-repository "https://europe-maven.pkg.dev/kestra-host/maven-remote" \
+            --maven-username oauth2accesstoken \
+            --maven-password "$(gcloud auth print-access-token)" \
+            --plugins-dir ./plugins-catalog \
+            --plugins "$PLUGINS" \
+            --concurrency 50
+
+      - name: Schema bundle - Generate and embed it in the jar
+        shell: bash
+        if: ${{ inputs.embed-plugins-schema-bundle }}
+        run: |
+          set -euo pipefail
+          EXECUTABLE=$(ls build/executable/*)
+          chmod +x "$EXECUTABLE"
+          "$EXECUTABLE" plugins-schema --plugins ./plugins-catalog -o build/plugins-schema.json
+          ./gradlew executableJar -PpluginsSchemaBundle=build/plugins-schema.json --console=plain
+
+      - name: Artifacts - Copy exe to image
+        shell: bash
+        run: |
+          cp build/executable/* docker/app/kestra && chmod +x docker/app/kestra
+
+      # Upload artifacts — independent, different artifact names and source paths.
+      - parallel:
+          - name: Artifacts - Upload JAR
+            uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+            with:
+              name: jar
+              path: build/libs/
+
+          - name: Artifacts - Upload Executable
+            uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+            with:
+              name: exe
+              path: build/executable/
